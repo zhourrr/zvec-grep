@@ -17,8 +17,6 @@ static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub(super) fn initialize() -> EngineResult<()> {
     match INITIALIZED.get_or_init(|| {
-        // `num_threads` overrides both query and optimize pools. Use zvec's
-        // native defaults for each pool, matching the Node CLI.
         let config = zvec_rust::ConfigBuilder::new()
             .memory_limit(512 * 1024 * 1024)
             .build();
