@@ -33,54 +33,37 @@ fn output_options() -> zg_cli::OutputOptions {
 fn report_error(error: &(dyn Error + 'static)) {
     let options = output_options();
     let terminal = zg_cli::stderr_supports_ansi();
-    if terminal {
-        let report = if let Some(error) = error.downcast_ref::<EngineError>() {
-            Some((error.report(), None))
-        } else {
-            match error.downcast_ref::<zg_daemon::DaemonError>() {
-                Some(zg_daemon::DaemonError::Remote { report, retryable }) => {
-                    Some(((**report).clone(), Some(*retryable)))
-                }
-                Some(zg_daemon::DaemonError::Engine(error)) => Some((error.report(), None)),
-                _ => None,
-            }
-        };
-        if let Some((report, retryable)) = report {
-            let _ = zg_cli::write_error_report(
-                io::stderr().lock(),
-                &report,
-                retryable,
-                options,
-                terminal,
-            );
-        } else {
-            let _ = zg_cli::write_error_message(
-                io::stderr().lock(),
-                &error.to_string(),
-                options,
-                terminal,
-            );
-        }
-    } else if let Some(error) = error.downcast_ref::<EngineError>() {
-        eprintln!("{}", error.report());
+    let report = if let Some(error) = error.downcast_ref::<EngineError>() {
+        Some((error.report(), None))
     } else {
-        eprintln!("Error: {error}");
+        match error.downcast_ref::<zg_daemon::DaemonError>() {
+            Some(zg_daemon::DaemonError::Remote { report, retryable }) => {
+                Some(((**report).clone(), Some(*retryable)))
+            }
+            Some(zg_daemon::DaemonError::Engine(error)) => Some((error.report(), None)),
+            _ => None,
+        }
+    };
+    if let Some((report, retryable)) = report {
+        let _ =
+            zg_cli::write_error_report(io::stderr().lock(), &report, retryable, options, terminal);
+    } else {
+        let _ =
+            zg_cli::write_error_message(io::stderr().lock(), &error.to_string(), options, terminal);
     }
 }
 
 fn report_warning(message: &str) {
-    if zg_cli::stderr_supports_ansi() {
-        let _ = zg_cli::write_message(
-            io::stderr().lock(),
-            zg_cli::MessageKind::Warning,
-            message.trim_start_matches("warning: "),
-            &[],
-            output_options().color,
-            true,
-        );
-    } else {
-        eprintln!("{message}");
-    }
+    let _ = zg_cli::write_message(
+        io::stderr().lock(),
+        zg_cli::MessageKind::Warning,
+        message
+            .trim_start_matches("Warning: ")
+            .trim_start_matches("warning: "),
+        &[],
+        output_options().color,
+        zg_cli::stderr_supports_ansi(),
+    );
 }
 
 fn animated_progress(options: zg_cli::OutputOptions) -> bool {
@@ -116,32 +99,28 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode, Box<dyn Error>> {
     let arguments = std::env::args_os().collect::<Vec<_>>();
     let warning = zg_cli::compatibility_warning_for_args(&arguments[1..]);
+    let cli = Cli::try_parse_from(arguments).unwrap_or_else(|error| {
+        if let Some(warning) = &warning {
+            let _ = zg_cli::write_warning(
+                io::stderr().lock(),
+                warning,
+                zg_cli::ColorMode::Auto,
+                zg_cli::stderr_supports_ansi(),
+            );
+        }
+        zg_cli::exit_parse_error(&error);
+    });
+    let _ = OUTPUT_OPTIONS.set(cli.output_options());
     let warn = || {
         if let Some(warning) = &warning {
-            report_warning(warning);
+            let _ = zg_cli::write_warning(
+                io::stderr().lock(),
+                warning,
+                output_options().color,
+                zg_cli::stderr_supports_ansi(),
+            );
         }
     };
-    let cli = match Cli::try_parse_from(arguments) {
-        Ok(cli) => cli,
-        Err(error) => {
-            warn();
-            if zg_cli::stderr_supports_ansi() && error.use_stderr() {
-                // Parse errors may precede valid presentation options; keep this path colorless.
-                zg_cli::write_error_message(
-                    io::stderr().lock(),
-                    &error.to_string(),
-                    zg_cli::OutputOptions {
-                        color: zg_cli::ColorMode::Never,
-                        ..Default::default()
-                    },
-                    true,
-                )?;
-                return Ok(ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(2)));
-            }
-            error.exit();
-        }
-    };
-    let _ = OUTPUT_OPTIONS.set(cli.output_options());
     let positional_warning = cli.positional_query_warning();
     let plan = cli
         .into_plan(std::env::current_dir()?)
@@ -173,14 +152,30 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
     if let Some(warning) = positional_warning {
         report_warning(&warning);
     }
-    let debug = match &plan {
-        CliPlan::Query { output, .. }
-        | CliPlan::Index { output, .. }
-        | CliPlan::Status { output, .. } => output.debug,
-        _ => false,
+    let error_presentation = match &plan {
+        CliPlan::Query {
+            request, output, ..
+        } => Some((*output, request.root.clone())),
+        CliPlan::Status {
+            request, output, ..
+        } => Some((*output, request.root.clone())),
+        CliPlan::Index {
+            operation, output, ..
+        } => {
+            let root = match operation {
+                IndexOperation::Build(request) => request.root.clone(),
+                IndexOperation::Drop(request) => request.root.clone(),
+            };
+            Some((*output, root))
+        }
+        _ => None,
     };
     if !matches!(plan, CliPlan::Server(ServerPlan::Run(_))) {
-        init_tracing(debug);
+        init_tracing(
+            error_presentation
+                .as_ref()
+                .is_some_and(|(output, _)| output.debug),
+        );
     }
 
     // The grep walker owns its search threads; a Tokio worker pool would duplicate them.
@@ -190,7 +185,22 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
         Builder::new_multi_thread().enable_all().build()?
     };
 
-    runtime.block_on(Box::pin(execute_plan(plan)))
+    let result = runtime.block_on(Box::pin(execute_plan(plan)));
+    if let Err(error) = &result
+        && let Some((output, root)) = error_presentation
+        && let Some(report) = engine_error_report(error.as_ref())
+        && report.code == EngineError::INDEX_INCOMPATIBLE
+    {
+        zg_cli::write_index_incompatible_error(
+            io::stderr().lock(),
+            &report,
+            root.as_deref(),
+            output,
+            zg_cli::stderr_supports_ansi(),
+        )?;
+        return Ok(ExitCode::FAILURE);
+    }
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -483,7 +493,7 @@ async fn execute_request(
     if path_lookup {
         // Current-file lookup is local in every client mode, before index or model admission.
         report_warning(
-            "warning: automatically performing path lookup; use --hybrid to force hybrid search.",
+            "Warning: automatically performing path lookup; use --hybrid to force hybrid search.",
         );
         let engine = ZvecGrep::new();
         let result = engine
@@ -536,6 +546,17 @@ fn is_engine_error(error: &(dyn Error + 'static), code: &str) -> bool {
         Some(zg_daemon::DaemonError::Remote { report, .. }) => report.code == code,
         Some(zg_daemon::DaemonError::Engine(error)) => error.code() == code,
         _ => false,
+    }
+}
+
+fn engine_error_report(error: &(dyn Error + 'static)) -> Option<zg_engine::ErrorReport> {
+    if let Some(error) = error.downcast_ref::<EngineError>() {
+        return Some(error.report());
+    }
+    match error.downcast_ref::<zg_daemon::DaemonError>() {
+        Some(zg_daemon::DaemonError::Remote { report, .. }) => Some((**report).clone()),
+        Some(zg_daemon::DaemonError::Engine(error)) => Some(error.report()),
+        _ => None,
     }
 }
 

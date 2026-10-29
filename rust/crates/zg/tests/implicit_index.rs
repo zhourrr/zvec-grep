@@ -599,10 +599,7 @@ fn direct_search_warns_about_unmatched_index_drift_on_stderr() {
         "off",
         "--no-color",
     ]);
-    assert_eq!(
-        String::from_utf8_lossy(&stale.stdout),
-        "query groups (1):\nQ1 [supplemental]: needle\nhits: 0\n\nNo matches.\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&stale.stdout), "No matches.\n");
     assert!(String::from_utf8_lossy(&stale.stderr).contains("status: possibly_stale\nresults: served_from_current_index\nbackground_refresh: idle (0/1)\n"), "{}", String::from_utf8_lossy(&stale.stderr));
 }
 
@@ -623,6 +620,85 @@ fn noninteractive_missing_index_requires_explicit_creation() {
     );
     assert!(output.stdout.is_empty());
     assert!(!fixture.root.path().join(".zvec-grep").exists());
+}
+
+#[test]
+fn incompatible_index_errors_are_actionable_without_rebuilding_existing_data() {
+    for mode in ["direct", "server"] {
+        let mut fixture = Fixture::new();
+        let index_home = fixture.root.path().join(".zvec-grep");
+        let legacy_storage = index_home.join("index.zvec");
+        fs::create_dir_all(&legacy_storage).expect("legacy storage");
+        let manifest_path = index_home.join("manifest.json");
+        let manifest = serde_json::to_vec(&json!({
+            "manifestVersion": 1,
+            "indexVersion": 1,
+        }))
+        .expect("legacy manifest JSON");
+        fs::write(&manifest_path, &manifest).expect("legacy manifest");
+        let sentinel_path = legacy_storage.join("original-index-data");
+        let sentinel = b"retain the existing index until an explicit rebuild";
+        fs::write(&sentinel_path, sentinel).expect("legacy index data");
+        if mode == "server" {
+            fixture.start_server();
+        }
+
+        for (presentation, options) in [
+            ("plain", Vec::<&str>::new()),
+            ("colored", vec!["--color", "always"]),
+            ("debug", vec!["--debug", "--no-color"]),
+        ] {
+            let mut arguments = vec!["--mode", mode, "--fts", "needle"];
+            arguments.extend(options);
+            let output = fixture
+                .command(&arguments)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("query incompatible index");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{mode}/{presentation}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{mode}/{presentation}");
+            assert!(
+                stderr.contains("This index is incompatible with the current version of zg."),
+                "{mode}/{presentation}: {stderr}"
+            );
+            assert!(stderr.contains("zg --index --rebuild"), "{stderr}");
+            if presentation == "debug" {
+                assert!(stderr.contains("unsupported index version 1"), "{stderr}");
+                assert!(stderr.contains("expected 2"), "{stderr}");
+                assert!(stderr.contains("Error location:"), "{stderr}");
+            } else {
+                for internal_detail in [
+                    "unsupported index version",
+                    "expected 2",
+                    "manifest.json",
+                    "Error location:",
+                    "ZG.ENGINE.",
+                ] {
+                    assert!(!stderr.contains(internal_detail), "{stderr}");
+                }
+            }
+            if presentation == "colored" {
+                assert!(stderr.contains("\u{1b}[31m"), "{stderr:?}");
+                assert!(stderr.contains("\u{1b}[36m"), "{stderr:?}");
+            } else {
+                assert!(!stderr.contains("\u{1b}["), "{stderr:?}");
+            }
+            assert_eq!(
+                fs::read(&manifest_path).expect("preserved manifest"),
+                manifest
+            );
+            assert_eq!(
+                fs::read(&sentinel_path).expect("preserved index"),
+                sentinel.as_slice()
+            );
+            assert!(!index_home.join("index").exists());
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -664,7 +740,10 @@ fn configured_local_models_follow_environment_then_global_default_precedence() {
         }
         let output = success(terminal::run(command, &[("Enter Build", b"\r")]));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Select an embedding model"), "{stderr}");
+        assert!(
+            stderr.contains("Choose a model to build the index and continue this search."),
+            "{stderr}"
+        );
         fixture.assert_model("direct", expected);
     }
 }
@@ -690,12 +769,12 @@ fn auto_and_server_build_at_the_query_root_not_the_daemon_working_directory() {
         }
         let output = success(terminal::run(command, &[("Enter Build", b"\r")]));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Select an embedding model"), "{stderr}");
-        assert!(stderr.contains("No indexable files"), "{stderr}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "query groups (1):\nQ1 [supplemental]: needle\nhits: 0\n\nNo matches.\n"
+        assert!(
+            stderr.contains("Choose a model to build the index and continue this search."),
+            "{stderr}"
         );
+        assert!(stderr.contains("No indexable files"), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
         let status = success(
             fixture
                 .command(&["--status", "--mode", mode, "--no-color"])
@@ -815,10 +894,7 @@ fn existing_local_and_remote_indexes_are_reused_from_nested_directories() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!stderr.contains("No index found"), "{stderr}");
             assert!(!stderr.contains("Index ready"), "{stderr}");
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
-                "query groups (1):\nQ1 [supplemental]: needle\nhits: 0\n\nNo matches.\n"
-            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
             fixture.assert_model(mode, reference);
             assert!(!nested.join(".zvec-grep").exists());
         }
@@ -1047,13 +1123,16 @@ fn cancelling_model_selection_exits_without_error_or_index() {
                 !stderr.contains("Index creation cancelled"),
                 "{mode}: {stderr}"
             );
-            assert!(!stderr.contains("error["), "{mode}: {stderr}");
+            assert!(
+                !stderr.to_ascii_lowercase().contains("error["),
+                "{mode}: {stderr}"
+            );
             assert!(
                 !stderr.to_ascii_lowercase().contains("error:"),
                 "{mode}: {stderr}"
             );
             assert!(
-                stderr.contains("Select an embedding model"),
+                stderr.contains("Choose a model to build the index and continue this search."),
                 "{mode}: {stderr}"
             );
             assert!(!fixture.root.path().join(".zvec-grep").exists());
@@ -1105,10 +1184,7 @@ fn remote_authorization_can_return_to_model_selection_without_sending_data() {
             .is_none()
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("setup-test-secret"));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "query groups (1):\nQ1 [supplemental]: needle\nhits: 0\n\nNo matches.\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1185,7 +1261,7 @@ async fn remote_allow_once_keeps_query_credentials_temporary_through_build_and_q
         );
         assert!(!manifest.to_string().contains("setup-test-secret"));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.starts_with("query groups (1):\n"), "{stdout}");
+        assert!(stdout.starts_with("#1 "), "{stdout}");
         assert!(stdout.contains("needle.txt"));
         assert!(!stdout.contains("setup-test-secret"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("setup-test-secret"));
@@ -1376,10 +1452,7 @@ fn matching_workspace_consent_skips_the_remote_authorization_screen() {
     ));
     fixture.assert_model("direct", "qwen/text-embedding-v4");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Remote embedding authorization"));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "query groups (1):\nQ1 [supplemental]: needle\nhits: 0\n\nNo matches.\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1444,8 +1517,8 @@ async fn warm_index_path_lookups_return_current_text_or_no_matches_without_vecto
             assert_eq!(
                 stderr,
                 concat!(
-                    "warning: automatically performing path lookup; use --hybrid to force hybrid search.\n",
-                    "warning: no matching file paths; searching current file contents literally (rg).\n"
+                    "Warning: automatically performing path lookup; use --hybrid to force hybrid search.\n",
+                    "Warning: no matching file paths; searching current file contents literally (rg).\n"
                 )
             );
             if query == "missing.ts" {

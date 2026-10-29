@@ -1,6 +1,7 @@
 //! Command-line parsing, validation, request construction, and terminal rendering.
 
 mod authorization;
+mod diagnostics;
 mod highlight;
 mod install;
 mod jsonc;
@@ -17,6 +18,7 @@ mod status;
 mod stdio;
 mod terminal;
 mod theme;
+pub use diagnostics::{exit_parse_error, format_error_report};
 pub use management::{
     write_authorization_revoke_result, write_authorization_revoke_with_options,
     write_authorization_status, write_config_result, write_index_drop_result,
@@ -75,6 +77,7 @@ pub use path_lookup::{write_path_lookup_result, write_path_lookup_with_terminals
 pub use render::{
     HelpTopicError, help_text, print_help, write_context_result, write_context_status,
     write_context_status_with_options, write_context_with_options, write_file_paths,
+    write_index_incompatible_error, write_warning,
 };
 
 #[derive(Debug, Parser)]
@@ -821,7 +824,7 @@ impl Cli {
     pub fn parse() -> Self {
         match Self::try_parse_from(std::env::args_os()) {
             Ok(cli) => cli,
-            Err(error) => error.exit(),
+            Err(error) => exit_parse_error(&error),
         }
     }
 
@@ -891,7 +894,7 @@ impl Cli {
             return None;
         }
         Some(format!(
-            "warning: positional query arguments are merged into one query: {:?}. For separate queries, use repeated --hybrid flags, e.g. zg --hybrid \"connection pool\" --hybrid \"socket timeout\".",
+            "Warning: positional query arguments are merged into one query: {:?}. For separate queries, use repeated --hybrid flags, e.g. zg --hybrid \"connection pool\" --hybrid \"socket timeout\".",
             parts.join(" ")
         ))
     }
@@ -964,7 +967,7 @@ pub fn compatibility_warning_for_args(arguments: &[OsString]) -> Option<String> 
     let first = arguments.first()?.to_str()?;
     if matches!(first, "query" | "search") {
         return Some(format!(
-            "warning: \"zg {first} ...\" is not a subcommand; search is already the default. Remove \"{first}\", or use 'zg -- \"{first}\" ...' to search for that literal word."
+            "Warning: \"{first}\" is search text. Omit it to search the remaining words."
         ));
     }
     if matches!(
@@ -979,8 +982,13 @@ pub fn compatibility_warning_for_args(arguments: &[OsString]) -> Option<String> 
             | "help"
             | "version"
     ) {
+        let purpose = if first == "version" {
+            "To display the CLI version"
+        } else {
+            "To run this command"
+        };
         return Some(format!(
-            "warning: \"zg {first} ...\" no longer runs an action and is parsed as search input. Use \"zg --{first} ...\", or 'zg -- \"{first}\" ...' to search for that literal word."
+            "Warning: `zg {first}` is legacy syntax and now searches for \"{first}\".\n         {purpose}, use `zg --{first}`."
         ));
     }
     None
@@ -1301,7 +1309,7 @@ fn context_refresh_policy(
     use zg_engine::api::context::options::RefreshPolicy;
     if mode == ClientMode::Direct && matches!(refresh, Some(RefreshMode::Background)) {
         eprintln!(
-            "warning: --refresh background is unavailable in direct mode; falling back to off"
+            "Warning: --refresh background is unavailable in direct mode; falling back to off"
         );
     }
     match (mode, refresh) {
@@ -2018,8 +2026,12 @@ mod tests {
             let arguments = [word.into(), "second".into()];
             let warning =
                 super::compatibility_warning_for_args(&arguments).expect("migration warning");
-            assert!(warning.contains(&format!("zg {word}")));
-            assert!(warning.contains("literal word"));
+            if matches!(word, "query" | "search") {
+                assert!(warning.contains(&format!("\"{word}\" is search text.")));
+            } else {
+                assert!(warning.contains(&format!("now searches for \"{word}\".")));
+                assert!(warning.contains(&format!("`zg --{word}`")));
+            }
         }
         for word in ["--", "needle", "--rg", "--index", "--help", "--version"] {
             assert!(

@@ -124,9 +124,7 @@ fn version_mismatch(version: Option<u32>) -> String {
 }
 
 fn rebuild_required(reason: impl std::fmt::Display) -> EngineError {
-    EngineError::storage_failure(format!(
-        "{reason}; rebuild the index with `zg --index --rebuild`"
-    ))
+    EngineError::index_incompatible(reason.to_string())
 }
 
 pub(crate) fn inspect_workspace_manifest(
@@ -542,7 +540,13 @@ mod tests {
             .expect("write invalid manifest");
             let error = read_workspace_manifest(directory.path(), &layout)
                 .expect_err("enabled manifest requires a valid generation");
-            assert!(error.message().contains("storageGeneration"));
+            assert_eq!(error.code(), EngineError::INDEX_INCOMPATIBLE);
+            assert!(
+                error
+                    .help()
+                    .expect("manifest diagnostics")
+                    .contains("storageGeneration")
+            );
         }
         write_workspace_manifest(layout.manifest_path(), &manifest).expect("write valid manifest");
         assert_eq!(
@@ -869,8 +873,9 @@ mod tests {
 
         let error =
             read_workspace_manifest(directory.path(), &layout).expect_err("rebuild required");
-        assert!(error.message().contains("relative"));
-        assert!(error.message().contains("zg --index --rebuild"));
+        let diagnostics = error.help().expect("manifest diagnostics");
+        assert!(diagnostics.contains("relative"));
+        assert!(diagnostics.contains("zg --index --rebuild"));
         assert!(
             inspect_workspace_manifest(directory.path(), &layout)
                 .expect("inspect")
@@ -1180,13 +1185,15 @@ mod tests {
             .expect("unsupported manifest");
             let error = read_workspace_manifest(directory.path(), &layout)
                 .expect_err("unsupported index version");
-            assert!(
-                error
-                    .message()
-                    .contains(&format!("unsupported index version {version}"))
+            assert_eq!(error.code(), EngineError::INDEX_INCOMPATIBLE);
+            assert_eq!(
+                error.message(),
+                "This index is incompatible with the current version of zg."
             );
-            assert!(error.message().contains("expected 2"));
-            assert!(error.message().contains("zg --index --rebuild"));
+            let diagnostics = error.help().expect("version diagnostics");
+            assert!(diagnostics.contains(&format!("unsupported index version {version}")));
+            assert!(diagnostics.contains("expected 2"));
+            assert!(diagnostics.contains("zg --index --rebuild"));
             fs::write(layout.manifest_path(), &bytes).expect("restore current manifest");
         }
     }
@@ -1211,7 +1218,8 @@ mod tests {
             assert!(
                 read_workspace_manifest(directory.path(), &layout)
                     .expect_err("version required")
-                    .message()
+                    .help()
+                    .expect("rebuild guidance")
                     .contains("rebuild")
             );
             assert!(

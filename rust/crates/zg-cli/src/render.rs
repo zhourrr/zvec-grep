@@ -23,6 +23,68 @@ use zg_engine::api::context::{
 
 use crate::{highlight::highlight_ranges, output_path, theme::StatusTheme};
 
+/// Writes a warning with a trailing blank line, highlighting its label and commands.
+/// # Errors
+/// Returns the underlying writer error.
+pub fn write_warning(
+    mut writer: impl Write,
+    warning: &str,
+    color: crate::ColorMode,
+    terminal: bool,
+) -> io::Result<()> {
+    let theme = crate::theme::StatusTheme::new(color, terminal);
+    let message = if let Some(message) = warning.strip_prefix("Warning:") {
+        write!(writer, "{}", theme.warning("Warning:"))?;
+        message
+    } else {
+        warning
+    };
+    for (index, part) in message.split('`').enumerate() {
+        if index % 2 == 1 {
+            write!(writer, "{}", theme.path(&format!("`{part}`")))?;
+        } else {
+            write!(writer, "{part}")?;
+        }
+    }
+    writeln!(writer, "\n")
+}
+
+/// Presents an incompatible index without exposing internal diagnostics by default.
+/// # Errors
+/// Returns the underlying writer error.
+pub fn write_index_incompatible_error(
+    mut writer: impl Write,
+    report: &zg_engine::ErrorReport,
+    root: Option<&Path>,
+    options: crate::OutputOptions,
+    terminal: bool,
+) -> io::Result<()> {
+    let theme = crate::theme::StatusTheme::new(options.color, terminal);
+    writeln!(
+        writer,
+        "{}",
+        theme.danger(&format!("Error: {}", report.message))
+    )?;
+    if let Some(root) = root {
+        writeln!(
+            writer,
+            "\nRebuild the index for {} to continue:",
+            theme.path(&crate::theme::display_path(root))
+        )?;
+    } else {
+        writeln!(writer, "\nRebuild the index to continue:")?;
+    }
+    writeln!(writer, "  {}", theme.path("zg --index --rebuild"))?;
+    if options.debug {
+        writeln!(
+            writer,
+            "\nDiagnostics:\n{}",
+            crate::format_error_report(report)
+        )?;
+    }
+    Ok(())
+}
+
 /// Writes only native file paths, separated by newlines or NUL bytes.
 ///
 /// # Errors
@@ -178,7 +240,11 @@ pub fn write_context_status_with_options(
         return Ok(());
     }
     let theme = StatusTheme::new(options.color, terminal);
-    writeln!(writer, "{} Index may be out of date", theme.warning("!"))?;
+    writeln!(
+        writer,
+        "{} Index may be out of date",
+        theme.warning("Warning:")
+    )?;
     writeln!(writer, "  Results use the current index")?;
     if let Some(state) = result
         .indexing
@@ -358,7 +424,7 @@ Preview modes: none keeps one source line; short uses compact bounded source;
 full uses compact full source; detail adds metadata, outlines, and file grouping.
 Full previews do not retrieve an entire function or file. TTY affects only color.
 
-All preview modes preserve query groups, their ranks, and matched content.
+All preview modes preserve result order, ranks, and matched content.
 A result appears in each matching group; only --fuse combines groups.
 
 Embedding runtime:
@@ -926,6 +992,15 @@ mod output_tests {
         result.query = "find ImportantSymbol".into();
         result.items[0].relative_path = "ImportantSymbol.rs".into();
         result.items[0].content = "İ 中文 ImportantSymbol here".into();
+        result.items[0].metadata = Some(EntityMetadata::Code(CodeMetadata {
+            symbol_type: Some(zg_engine::api::context::options::SymbolType::Function),
+            symbol_name: Some("MetadataSymbol".into()),
+            scope: Some("namespace".into()),
+            signature: None,
+            visibility: None,
+            language: None,
+            documentation: None,
+        }));
         for source in [ContextSource::Index, ContextSource::Rg] {
             result.source = source;
             result.items[0].match_ranges = if source == ContextSource::Rg {
@@ -983,10 +1058,26 @@ mod output_tests {
                     );
                     assert_eq!(output.contains('\x1b'), styled);
                     assert!(output.contains("ImportantSymbol.rs"));
-                    if preview == PreviewMode::Detail && source == ContextSource::Index && styled {
-                        assert!(output.contains(
-                            "\x1b[2mQuery\x1b[0m: \x1b[1;33mfind ImportantSymbol\x1b[0m"
-                        ));
+                    assert!(!output.contains("find ImportantSymbol"));
+                    if source == ContextSource::Index {
+                        let (label, value, scope) = if preview == PreviewMode::Detail {
+                            ("Symbol:", "MetadataSymbol", "Scope:")
+                        } else {
+                            ("symbol:", "function MetadataSymbol", "scope:")
+                        };
+                        let expected = if styled {
+                            format!("\x1b[35m{label}\x1b[0m {value}")
+                        } else {
+                            format!("{label} {value}")
+                        };
+                        assert!(output.contains(&expected), "{preview:?}: {output:?}");
+                        let expected_scope = if styled {
+                            format!("\x1b[35m{scope}\x1b[0m namespace")
+                        } else {
+                            format!("{scope} namespace")
+                        };
+                        assert!(output.contains(&expected_scope), "{output:?}");
+                        assert!(!output.contains("\x1b[1;35m"), "{output:?}");
                     }
                     assert_eq!(result, original);
                 }
@@ -995,7 +1086,7 @@ mod output_tests {
     }
 
     #[test]
-    fn context_highlighting_follows_visible_preview_without_coloring_metadata() {
+    fn context_highlighting_follows_visible_preview_without_coloring_metadata_values() {
         let mut result = indexed_result();
         result.query = "needle".into();
         result.items[0].content = format!("{}needle\nneedle", "x".repeat(160));
@@ -1026,7 +1117,7 @@ mod output_tests {
                 output.matches("\x1b[1;33mneedle\x1b[0m").count(),
                 expected_matches
             );
-            assert!(output.contains("heading: needle\n"));
+            assert!(output.contains("\x1b[35mheading:\x1b[0m needle\n"));
         }
     }
 
@@ -1113,6 +1204,7 @@ mod output_tests {
                             ..OutputOptions::default()
                         },
                         &QueryHighlighter::default(),
+                        crate::theme::StatusTheme::new(crate::ColorMode::Never, false),
                     )
                     .expect("source preview");
                     let expected = if whole_entity {
@@ -1190,7 +1282,7 @@ mod output_tests {
             .expect("terminal status");
         assert_eq!(
             String::from_utf8(terminal).expect("UTF-8"),
-            "! Index may be out of date\n  Results use the current index\n  Refresh: running · 2/3 files\n"
+            "Warning: Index may be out of date\n  Results use the current index\n  Refresh: running · 2/3 files\n"
         );
         let mut redirected = Vec::new();
         let mut original = Vec::new();
@@ -1219,7 +1311,7 @@ mod output_tests {
             String::from_utf8(buffer).expect("UTF-8")
         };
         let minimal = render(PreviewMode::None, false);
-        assert!(minimal.contains("#1 matchedBy=fts sample.rs:1-20"));
+        assert!(minimal.contains("#1 sample.rs:1-20"));
         assert!(minimal.contains("1\tline1"));
         assert!(!minimal.contains("2\tline2"));
         let short = render(PreviewMode::Short, false);
@@ -1272,6 +1364,7 @@ mod output_tests {
                 &item,
                 OutputOptions::default(),
                 &QueryHighlighter::default(),
+                crate::theme::StatusTheme::new(crate::ColorMode::Never, false),
             )
             .expect("render symbol metadata");
             let rendered = String::from_utf8(buffer).expect("UTF-8");

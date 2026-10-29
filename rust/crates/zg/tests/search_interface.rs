@@ -39,11 +39,17 @@ fn command_shaped_queries_warn_once_and_still_search() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{word}: {stderr}");
-        assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
-        assert!(stderr.contains("literal word"), "{stderr}");
+        assert_eq!(stderr.matches("Warning:").count(), 1, "{stderr}");
+        let message = if matches!(word, "query" | "search") {
+            format!("\"{word}\" is search text.")
+        } else {
+            format!("now searches for \"{word}\".")
+        };
+        assert!(stderr.contains(&message), "{stderr}");
+        assert!(!stderr.contains('\u{1b}'), "{stderr}");
         assert!(stdout.contains("source.txt"), "{stdout}");
         assert!(stdout.contains(word), "{stdout}");
-        assert!(!stdout.contains("warning:"), "{stdout}");
+        assert!(!stdout.contains("Warning:"), "{stdout}");
     }
     assert!(!root.path().join(".zvec-grep").exists());
 }
@@ -66,7 +72,7 @@ fn literal_flags_and_command_words_do_not_warn_or_run_actions() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "{word}: {stderr}");
-            assert!(!stderr.contains("warning:"), "{stderr}");
+            assert!(!stderr.contains("Warning:"), "{stderr}");
             assert!(stdout.contains("source.txt"), "{stdout}");
             assert!(stdout.contains(word), "{stdout}");
         }
@@ -87,7 +93,7 @@ fn removed_flags_and_ambiguous_actions_fail_without_side_effects() {
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
         if arguments[0] == "index" {
-            assert!(stderr.contains("no longer runs an action"), "{stderr}");
+            assert!(stderr.contains("`zg --index`"), "{stderr}");
         }
         if arguments[0] == "--human" {
             assert!(stderr.contains("--human has been removed"), "{stderr}");
@@ -97,9 +103,9 @@ fn removed_flags_and_ambiguous_actions_fail_without_side_effects() {
 }
 
 const PATH_LOOKUP_NOTICE: &str =
-    "warning: automatically performing path lookup; use --hybrid to force hybrid search.\n";
+    "Warning: automatically performing path lookup; use --hybrid to force hybrid search.\n";
 const TEXT_FALLBACK_NOTICE: &str =
-    "warning: no matching file paths; searching current file contents literally (rg).\n";
+    "Warning: no matching file paths; searching current file contents literally (rg).\n";
 
 #[test]
 fn file_lookup_prints_ranked_path_matches_in_every_client_mode_without_a_daemon() {
@@ -138,7 +144,7 @@ fn file_lookup_prints_ranked_path_matches_in_every_client_mode_without_a_daemon(
             let expected: Vec<_> = expected
                 .iter()
                 .enumerate()
-                .map(|(index, path)| format!("#{} matchedBy=path {path}", index + 1))
+                .map(|(index, path)| format!("#{} {path}", index + 1))
                 .collect();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let actual: Vec<_> = stdout.lines().collect();

@@ -100,6 +100,7 @@ impl EngineError {
     pub const PERMISSION_DENIED: &str = "ZG.ENGINE.PERMISSION_DENIED";
     pub const RESOURCE_BUSY: &str = "ZG.ENGINE.RESOURCE_BUSY";
     pub const RESOURCE_CLOSED: &str = "ZG.ENGINE.RESOURCE_CLOSED";
+    pub const INDEX_INCOMPATIBLE: &str = "ZG.ENGINE.INDEX_INCOMPATIBLE";
     pub const STORAGE_FAILURE: &str = "ZG.ENGINE.STORAGE_FAILURE";
     pub const CANCELLED: &str = "ZG.ENGINE.CANCELLED";
     pub const DEADLINE_EXCEEDED: &str = "ZG.ENGINE.DEADLINE_EXCEEDED";
@@ -141,6 +142,19 @@ impl EngineError {
     #[must_use]
     pub fn resource_closed(message: impl Into<String>) -> Self {
         Self::new(Self::RESOURCE_CLOSED, message)
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn index_incompatible(reason: impl Into<String>) -> Self {
+        Self::new(
+            Self::INDEX_INCOMPATIBLE,
+            "This index is incompatible with the current version of zg.",
+        )
+        .with_help(format!(
+            "{}; rebuild the index with `zg --index --rebuild`",
+            reason.into()
+        ))
     }
 
     #[track_caller]
