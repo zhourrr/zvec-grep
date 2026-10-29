@@ -145,7 +145,7 @@ fn status_uses_grouped_layout_compact_paths_and_explicit_color_policy() {
         colored.contains("\u{1b}[33m? Workspace index is not configured\u{1b}[0m"),
         "{colored:?}"
     );
-    assert!(colored.contains("\u{1b}[2m~\u{1b}[0m"), "{colored:?}");
+    assert!(colored.contains("\u{1b}[36m~\u{1b}[0m"), "{colored:?}");
     assert!(
         colored.contains("\u{1b}[2mStorage     \u{1b}[0m"),
         "{colored:?}"
