@@ -104,6 +104,7 @@ fn removed_flags_and_ambiguous_actions_fail_without_side_effects() {
 
 const PATH_LOOKUP_NOTICE: &str =
     "Warning: automatically performing path lookup; use --hybrid to force hybrid search.\n";
+const COLORED_PATH_LOOKUP_NOTICE: &str = "\x1b[33mWarning:\x1b[0m automatically performing path lookup; use --hybrid to force hybrid search.\n";
 const TEXT_FALLBACK_NOTICE: &str =
     "Warning: no matching file paths; searching current file contents literally (rg).\n";
 
@@ -373,7 +374,7 @@ fn path_lookup_smart_case_highlights_only_literal_matches_in_every_mode() {
         assert!(output.status.success(), "{mode}: {stderr}");
         assert_eq!(
             stderr,
-            format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
+            format!("{COLORED_PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
@@ -410,7 +411,7 @@ fn path_lookup_deduplicates_symbols_before_the_limit_and_highlights_only_matchin
         assert!(output.status.success(), "{mode}: {stderr}");
         assert_eq!(
             stderr,
-            format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
+            format!("{COLORED_PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.starts_with("refs.ts\n"), "{stdout}");
