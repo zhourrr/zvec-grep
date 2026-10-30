@@ -96,20 +96,26 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<ExitCode, Box<dyn Error>> {
+fn parse_cli() -> (Cli, Option<String>) {
     let arguments = std::env::args_os().collect::<Vec<_>>();
     let warning = zg_cli::compatibility_warning_for_args(&arguments[1..]);
+    let diagnostic_color = zg_cli::diagnostic_color_for_args(&arguments[1..]);
     let cli = Cli::try_parse_from(arguments).unwrap_or_else(|error| {
         if let Some(warning) = &warning {
             let _ = zg_cli::write_warning(
                 io::stderr().lock(),
                 warning,
-                zg_cli::ColorMode::Auto,
+                diagnostic_color,
                 zg_cli::stderr_supports_ansi(),
             );
         }
-        zg_cli::exit_parse_error(&error);
+        zg_cli::exit_parse_error(&error, diagnostic_color);
     });
+    (cli, warning)
+}
+
+fn run() -> Result<ExitCode, Box<dyn Error>> {
+    let (cli, warning) = parse_cli();
     let _ = OUTPUT_OPTIONS.set(cli.output_options());
     let warn = || {
         if let Some(warning) = &warning {
@@ -288,11 +294,7 @@ async fn execute_plan(plan: CliPlan) -> Result<ExitCode, Box<dyn Error>> {
             zg_cli::write_authorization_status(
                 zg_cli::stdout(),
                 &status,
-                if args.no_color {
-                    zg_cli::ColorMode::Never
-                } else {
-                    args.color.unwrap_or_default()
-                },
+                args.color.unwrap_or_default(),
                 zg_cli::stdout_supports_ansi(),
             )?;
             Ok(())

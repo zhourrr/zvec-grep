@@ -124,7 +124,7 @@ pub(super) fn write_item_preview(
             {
                 let kind = code
                     .symbol_type
-                    .map_or(String::new(), |kind| format!("{} ", enum_label(kind)));
+                    .map_or(String::new(), |kind| format!("[{}] ", enum_label(kind)));
                 let scope = code.scope.as_ref().map_or(String::new(), |scope| {
                     format!(" {} {scope}", theme.metadata_label("scope:"))
                 });

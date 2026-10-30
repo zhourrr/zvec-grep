@@ -70,7 +70,7 @@ pub(super) fn write_item_preview(
                 write!(writer, "{} ", theme.metadata_label("symbol:"))?;
                 if let Some(kind) = code.symbol_type {
                     let kind = serde_json::to_value(kind).map_err(io::Error::other)?;
-                    write!(writer, "{} ", kind.as_str().unwrap_or_default())?;
+                    write!(writer, "[{}] ", kind.as_str().unwrap_or_default())?;
                 }
                 write!(writer, "{name}")?;
                 if let Some(scope) = &code.scope {

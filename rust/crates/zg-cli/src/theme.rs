@@ -39,9 +39,6 @@ impl StatusTheme {
     pub fn selected_tab(self, value: &str) -> String {
         self.paint(value, "1;36")
     }
-    pub fn tag(self, value: &str) -> String {
-        self.paint(value, "1;35")
-    }
     pub fn metadata_label(self, value: &str) -> String {
         self.paint(value, "35")
     }

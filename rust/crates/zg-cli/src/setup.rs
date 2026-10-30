@@ -80,37 +80,12 @@ fn color_model_tabs(line: &str, theme: StatusTheme) -> String {
     )
 }
 
-fn model_label(reference: &str) -> String {
-    let label = match reference {
-        "local/potion-code-16m-v2" => " [ Code ]",
-        "local/potion-retrieval-32m" => " [ Text ]",
-        "local/potion-multilingual-128m" => " [ Multilingual ]",
-        _ => "",
-    };
-    format!("{reference}{label}")
-}
-
 fn color_model_row(line: &str, theme: StatusTheme) -> String {
-    let selected = line.trim_start().starts_with('›');
-    let ordinary = |value: &str| {
-        if selected {
-            theme.success(value)
-        } else {
-            value.to_owned()
-        }
-    };
-    for label in ["[ Code ]", "[ Text ]", "[ Multilingual ]"] {
-        if let Some(start) = line.find(label) {
-            let end = start + label.len();
-            return format!(
-                "{}{}{}",
-                ordinary(&line[..start]),
-                theme.tag(label),
-                ordinary(&line[end..])
-            );
-        }
+    if line.trim_start().starts_with('›') {
+        theme.success(line)
+    } else {
+        line.to_owned()
     }
-    ordinary(line)
 }
 
 fn directory_title(root: &Path) -> String {
@@ -397,13 +372,9 @@ impl ModelSelection {
             usize::from(height.saturating_sub(10_u16.saturating_add(title_rows))).clamp(1, 12);
         let active = self.positions[self.tab];
         let start = active.saturating_sub(visible - 1);
-        let labels = choices
+        let width = choices
             .iter()
-            .map(|model| model_label(&model.reference))
-            .collect::<Vec<_>>();
-        let width = labels
-            .iter()
-            .map(|label| label.chars().count())
+            .map(|model| model.reference.chars().count())
             .max()
             .unwrap_or(0);
         for (index, model) in choices.iter().enumerate().skip(start).take(visible) {
@@ -427,7 +398,7 @@ impl ModelSelection {
             lines.push(format!(
                 "  {} {:width$}  {status}",
                 if index == active { "›" } else { " " },
-                labels[index]
+                model.reference
             ));
         }
         if choices.is_empty() {
@@ -765,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn model_screen_preserves_wrapped_paths_and_distinguishes_tabs_from_tags() {
+    fn model_screen_preserves_wrapped_paths_and_colors_tabs_and_selection() {
         let title = directory_title(Path::new("/工作目录/project/long-directory"));
         let rows = color_directory_title(&title, 24, StatusTheme::new(ColorMode::Never, true));
         assert_eq!(rows.concat(), title);
@@ -777,10 +748,7 @@ mod tests {
         let lines = vec![
             title,
             LOCAL_MODEL_TABS.to_owned(),
-            format!(
-                "  › {}  Downloaded",
-                model_label("local/potion-code-16m-v2")
-            ),
+            "  › local/potion-code-16m-v2  Downloaded".to_owned(),
         ];
         let colored = String::from_utf8(render_screen(
             &lines,
@@ -790,7 +758,6 @@ mod tests {
         ))
         .expect("UTF-8 screen");
         assert!(colored.contains("\x1b[1;36m[ Local models ]\x1b[0m"));
-        assert!(colored.contains("\x1b[1;35m[ Code ]\x1b[0m"));
         assert!(colored.contains("\x1b[32m  › local/potion-code-16m-v2 "));
         let plain = render_screen(&lines, 100, StatusTheme::new(ColorMode::Never, true), true);
         assert!(!plain.contains(&b'\x1b'));

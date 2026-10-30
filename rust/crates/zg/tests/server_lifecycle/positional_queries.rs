@@ -89,7 +89,8 @@ fn verify_script_outlines(
                 "detail",
                 "--refresh",
                 "off",
-                "--no-color",
+                "--color",
+                "never",
             ])?;
             assert_command_success(&output);
             let text = String::from_utf8(output.stdout)?;
@@ -117,7 +118,8 @@ fn verify_positional_queries(
                 "--allow-remote",
                 "--refresh",
                 "off",
-                "--no-color",
+                "--color",
+                "never",
             ];
             args.extend(words);
             let output = run(&args)?;
@@ -208,7 +210,8 @@ fn verify_previews(
                 "outlineProbe",
                 "--refresh",
                 "off",
-                "--no-color",
+                "--color",
+                "never",
             ];
             if let Some(preview) = preview {
                 args.extend(["--preview", preview]);
@@ -283,7 +286,8 @@ fn verify_query_groups(
                     "--allow-remote",
                     "--refresh",
                     "off",
-                    "--no-color",
+                    "--color",
+                    "never",
                 ];
                 if fuse {
                     args.push("--fuse");

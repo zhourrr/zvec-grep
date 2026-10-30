@@ -265,7 +265,9 @@ Query echoes, group headings, hit counts and `matchedBy` labels are omitted from
 the CLI result display. Full previews do not retrieve an entire function or file.
 Metadata labels use purple, file locations use cyan, and query matches use yellow.
 Automatic colors are disabled for redirected output, `TERM=dumb`, or `NO_COLOR`;
-`--color always` explicitly enables colors and `--no-color` disables them.
+`--color always` explicitly enables colors, including through pipes, and
+`--color never` disables them. `--color auto` is the default; the redundant
+`--no-color` option is no longer accepted.
 The former `--compact` and `--human` options are no longer accepted.
 
 When an interactive search finds no index, it asks you to choose an embedding

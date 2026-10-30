@@ -148,7 +148,7 @@ fn short_and_full_keep_the_original_compact_layout_on_every_output() {
             PreviewMode::Short,
             concat!(
                 "#1 src/sample.ts:10-33\n",
-                "symbol: function resolveContext scope: Workspace\n",
+                "symbol: [function] resolveContext scope: Workspace\n",
                 "  17: retrieved-source-line-8\n",
                 "  18: retrieved-source-line-9\n",
                 "  19: retrieved-source-line-10\n",
@@ -170,7 +170,7 @@ fn short_and_full_keep_the_original_compact_layout_on_every_output() {
             PreviewMode::Full,
             concat!(
                 "#1 src/sample.ts:1-100\n",
-                "symbol: function resolveContext\n",
+                "symbol: [function] resolveContext\n",
                 "  50: function resolveContext() {\n",
                 "  51:   return true;\n",
                 "  52: }\n",

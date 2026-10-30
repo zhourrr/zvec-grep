@@ -414,6 +414,7 @@ is required. Use -g 'auth.ts' to select files by name.
 Result options:
   --limit <n>                       Maximum results per group (default: 7)
   --preview <none|short|full|detail> Indexed output detail (default: short)
+  --color <auto|always|never>       Color output (default: auto)
   --debug                           Print diagnostics to stderr
   --trace                           Include per-hit indexed search trace
   --refresh <background|wait|off>   Refresh policy (defaults: server=background, direct=off)
@@ -423,6 +424,8 @@ Result options:
 Preview modes: none keeps one source line; short uses compact bounded source;
 full uses compact full source; detail adds metadata, outlines, and file grouping.
 Full previews do not retrieve an entire function or file. TTY affects only color.
+Auto colors terminal output and leaves pipes plain; NO_COLOR disables auto color.
+Use --color always to retain color in pipes, or --color never to disable it.
 
 All preview modes preserve result order, ranks, and matched content.
 A result appears in each matching group; only --fuse combines groups.
@@ -482,6 +485,7 @@ Index options:
   --yes                             Confirm --drop without prompting
   --debug                           Print skipped-file diagnostics to stderr
   --mode <direct|server|auto>       Select indexing transport
+  --color <auto|always|never>       Color output (default: auto)
 
 Embedding options:
   --embedding <model>               Single text embedding model for this workspace
@@ -572,7 +576,10 @@ Shows the nearest workspace root, index policy, index state, embedding model,
 stored paths, refresh status, and suggested next action.
 
 --check-ready preserves the normal output and exits non-zero unless the
-Workspace index is ready.";
+Workspace index is ready.
+
+Output:
+  --color <auto|always|never>       Color output (default: auto)";
 
 const CONFIG_HELP: &str = r"Usage:
   zg --config provider set <provider> --api-key <key>
@@ -613,7 +620,6 @@ the grant on another machine. Granting sends no remote data.
 
 Output:
   --color <auto|always|never>       Color output (default: auto)
-  --no-color                        Disable color output
 
 Scopes used during operations:
   once                              Current CLI command or Agent tool call only
@@ -875,7 +881,7 @@ State:
 Advanced:
   ZVEC_GREP_METAL_KEEP_RESIDENCY       Set to 1 to keep llama.cpp Metal residency enabled (advanced)
   ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM  Legacy index-only llama.cpp fallback after the index concurrency variable
-  NO_COLOR                             Disable terminal colors
+  NO_COLOR                             Disable automatic terminal colors; --color overrides it
 
 Agent integration paths:
   CODEX_HOME            Codex configuration directory used by zg --install
@@ -1063,7 +1069,7 @@ mod output_tests {
                         let (label, value, scope) = if preview == PreviewMode::Detail {
                             ("Symbol:", "MetadataSymbol", "Scope:")
                         } else {
-                            ("symbol:", "function MetadataSymbol", "scope:")
+                            ("symbol:", "[function] MetadataSymbol", "scope:")
                         };
                         let expected = if styled {
                             format!("\x1b[35m{label}\x1b[0m {value}")
@@ -1346,7 +1352,7 @@ mod output_tests {
             (None, "symbol: User scope: app"),
             (
                 Some(zg_engine::api::context::options::SymbolType::Enum),
-                "symbol: enum User scope: app",
+                "symbol: [enum] User scope: app",
             ),
         ] {
             item.metadata = Some(EntityMetadata::Code(CodeMetadata {

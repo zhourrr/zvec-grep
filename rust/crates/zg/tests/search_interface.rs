@@ -134,7 +134,7 @@ fn file_lookup_prints_ranked_path_matches_in_every_client_mode_without_a_daemon(
             (".\\src\\auth.ts", None, vec!["src/auth.ts"]),
             ("auth.ts", Some("src/**"), vec!["src/auth.ts"]),
         ] {
-            let mut args = vec![query, "--mode", mode, "--no-color"];
+            let mut args = vec![query, "--mode", mode, "--color", "never"];
             if let Some(filter) = filter {
                 args.extend(["-g", filter, "--limit", "1"]);
             }
