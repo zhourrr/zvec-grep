@@ -336,6 +336,7 @@ impl WorkspaceIndexService {
             ManifestState::RebuildRequired {
                 actual_version,
                 reason,
+                ..
             } => {
                 let mut info = unindexed_info(&source_root, &layout, WorkspaceIndexPolicy::Enabled);
                 info.compatibility = IndexCompatibility::RebuildRequired {

@@ -159,28 +159,16 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
         report_warning(&warning);
     }
     let error_presentation = match &plan {
-        CliPlan::Query {
-            request, output, ..
-        } => Some((*output, request.root.clone())),
-        CliPlan::Status {
-            request, output, ..
-        } => Some((*output, request.root.clone())),
-        CliPlan::Index {
-            operation, output, ..
-        } => {
-            let root = match operation {
-                IndexOperation::Build(request) => request.root.clone(),
-                IndexOperation::Drop(request) => request.root.clone(),
-            };
-            Some((*output, root))
-        }
+        CliPlan::Query { output, .. }
+        | CliPlan::Status { output, .. }
+        | CliPlan::Index { output, .. } => Some(*output),
         _ => None,
     };
     if !matches!(plan, CliPlan::Server(ServerPlan::Run(_))) {
         init_tracing(
             error_presentation
                 .as_ref()
-                .is_some_and(|(output, _)| output.debug),
+                .is_some_and(|output| output.debug),
         );
     }
 
@@ -193,14 +181,13 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
 
     let result = runtime.block_on(Box::pin(execute_plan(plan)));
     if let Err(error) = &result
-        && let Some((output, root)) = error_presentation
+        && let Some(output) = error_presentation
         && let Some(report) = engine_error_report(error.as_ref())
         && report.code == EngineError::INDEX_INCOMPATIBLE
     {
         zg_cli::write_index_incompatible_error(
             io::stderr().lock(),
             &report,
-            root.as_deref(),
             output,
             zg_cli::stderr_supports_ansi(),
         )?;
@@ -618,7 +605,9 @@ async fn ensure_query_index(
     if info.indexed || info.index_policy == WorkspaceIndexPolicy::Disabled {
         return Ok(false);
     }
-    info.compatibility.ensure_compatible()?;
+    info.compatibility
+        .ensure_compatible()
+        .map_err(|error| error.with_workspace_root(&info.root))?;
     if matches!(
         info.compatibility,
         zg_engine::api::info::result::IndexCompatibility::Compatible { .. }

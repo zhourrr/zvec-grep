@@ -55,7 +55,6 @@ pub fn write_warning(
 pub fn write_index_incompatible_error(
     mut writer: impl Write,
     report: &zg_engine::ErrorReport,
-    root: Option<&Path>,
     options: crate::OutputOptions,
     terminal: bool,
 ) -> io::Result<()> {
@@ -65,16 +64,22 @@ pub fn write_index_incompatible_error(
         "{}",
         theme.danger(&format!("Error: {}", report.message))
     )?;
-    if let Some(root) = root {
+    let command = if let Some(root) = report.workspace_root.as_deref() {
+        let shell = if cfg!(windows) { " (PowerShell)" } else { "" };
         writeln!(
             writer,
-            "\nRebuild the index for {} to continue:",
+            "\nRebuild the index for {} to continue{shell}:",
             theme.path(&crate::theme::display_path(root))
         )?;
+        format!("zg --index --rebuild {}", quote_rebuild_root(root))
     } else {
-        writeln!(writer, "\nRebuild the index to continue:")?;
-    }
-    writeln!(writer, "  {}", theme.path("zg --index --rebuild"))?;
+        writeln!(
+            writer,
+            "\nRun the rebuild command with the index directory to continue:"
+        )?;
+        "zg --index --rebuild <index-directory>".to_owned()
+    };
+    writeln!(writer, "  {}", theme.path(&command))?;
     if options.debug {
         writeln!(
             writer,
@@ -83,6 +88,22 @@ pub fn write_index_incompatible_error(
         )?;
     }
     Ok(())
+}
+
+fn quote_rebuild_root(root: &Path) -> String {
+    // Keep the actual absolute path: quoting a display-only `~` would prevent expansion.
+    let path = output_path(root).display().to_string();
+    if cfg!(windows) {
+        format!("'{}'", path.replace('\'', "''"))
+    } else if !path.is_empty()
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+    {
+        path
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
 }
 
 /// Writes only native file paths, separated by newlines or NUL bytes.
@@ -922,6 +943,21 @@ mod output_tests {
         ContextContentRole, ContextCoverage, ContextDiagnostics, ContextItemKind, ContextSource,
         MatchedBy,
     };
+
+    #[test]
+    fn incompatible_index_without_a_root_requires_an_explicit_directory() {
+        let report = zg_engine::EngineError::index_incompatible("missing root").report();
+        let mut output = Vec::new();
+        write_index_incompatible_error(&mut output, &report, OutputOptions::default(), false)
+            .expect("render recovery guidance");
+        let output = String::from_utf8(output).expect("UTF-8 output");
+        assert!(output.contains("zg --index --rebuild <index-directory>"));
+        assert!(
+            !output
+                .lines()
+                .any(|line| line.trim() == "zg --index --rebuild")
+        );
+    }
 
     #[cfg(unix)]
     #[test]

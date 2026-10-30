@@ -1,6 +1,10 @@
 //! Engine-wide error contract.
 
-use std::{fmt, io, panic::Location};
+use std::{
+    fmt, io,
+    panic::Location,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +46,9 @@ pub struct ErrorReport {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub help: Option<String>,
+    /// Actual workspace associated with the failure, including across daemon transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
     pub origin: ErrorSite,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_at: Option<ErrorSite>,
@@ -58,6 +65,7 @@ impl ErrorReport {
             code: code.to_owned(),
             message: message.into(),
             help: None,
+            workspace_root: None,
             origin,
             reported_at: None,
         }
@@ -240,6 +248,12 @@ impl EngineError {
     }
 
     #[must_use]
+    pub fn with_workspace_root(mut self, root: &Path) -> Self {
+        self.report.workspace_root = Some(root.to_path_buf());
+        self
+    }
+
+    #[must_use]
     pub fn with_origin(mut self, origin: ErrorSite) -> Self {
         self.report.origin = origin;
         self
@@ -335,9 +349,23 @@ mod tests {
         assert_eq!(value["message"], "workspace index does not exist");
         assert_eq!(value["help"], "Run `zg --index` to build it.");
         assert!(value.get("reported_at").is_none());
+        assert!(value.get("workspace_root").is_none());
 
         let decoded = serde_json::from_value(value).expect("error report should deserialize");
         assert_eq!(report, decoded);
+    }
+
+    #[test]
+    fn incompatible_index_report_preserves_the_workspace_across_transport() {
+        let root = std::env::temp_dir().join("project's workspace");
+        let report = EngineError::index_incompatible("unsupported manifest")
+            .with_workspace_root(&root)
+            .into_report();
+        let bytes = serde_json::to_vec(&report).expect("serialize error");
+        let decoded = serde_json::from_slice(&bytes).expect("deserialize error");
+        let restored = EngineError::from_report(decoded).into_report();
+        assert_eq!(restored.workspace_root.as_deref(), Some(root.as_path()));
+        assert_eq!(restored, report);
     }
 
     #[test]

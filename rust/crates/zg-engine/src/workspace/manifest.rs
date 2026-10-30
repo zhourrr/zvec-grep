@@ -1,5 +1,8 @@
 use serde::Deserialize;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     EngineError,
@@ -61,6 +64,7 @@ impl ManifestHeader {
                         "invalid workspace manifest '{}': {error}",
                         layout.manifest_path().display(),
                     ))
+                    .with_workspace_root(source_root)
                 })?;
         source.set_current_path(source_root)
     }
@@ -91,6 +95,7 @@ pub(crate) enum ManifestState {
     Missing,
     Current(Box<Workspace>),
     RebuildRequired {
+        source_root: PathBuf,
         actual_version: Option<u32>,
         reason: String,
     },
@@ -103,7 +108,11 @@ impl ManifestState {
             Self::Missing => Ok(None),
             Self::Current(manifest) => Ok(Some(*manifest)),
             Self::RebuildRequired { .. } if rebuild => Ok(None),
-            Self::RebuildRequired { reason, .. } => Err(rebuild_required(reason)),
+            Self::RebuildRequired {
+                source_root,
+                reason,
+                ..
+            } => Err(rebuild_required(reason).with_workspace_root(&source_root)),
         }
     }
 }
@@ -134,6 +143,7 @@ pub(crate) fn inspect_workspace_manifest(
     let Some(bytes) = read_manifest_bytes(layout)? else {
         if directory_exists(layout.index_dir())? && !layout.has_build_record()? {
             return Ok(ManifestState::RebuildRequired {
+                source_root: source_root.to_path_buf(),
                 actual_version: None,
                 reason: format!(
                     "workspace index '{}' has no manifest",
@@ -147,6 +157,7 @@ pub(crate) fn inspect_workspace_manifest(
         Ok(header) => header,
         Err(error) => {
             return Ok(ManifestState::RebuildRequired {
+                source_root: source_root.to_path_buf(),
                 actual_version: None,
                 reason: format!(
                     "invalid workspace manifest '{}': {error}",
@@ -158,6 +169,7 @@ pub(crate) fn inspect_workspace_manifest(
     let version = header.version();
     if let Some(reason) = header.compatibility_error() {
         return Ok(ManifestState::RebuildRequired {
+            source_root: source_root.to_path_buf(),
             actual_version: version,
             reason: format!(
                 "workspace manifest '{}': {reason}",
@@ -169,6 +181,7 @@ pub(crate) fn inspect_workspace_manifest(
         Ok(fields) => fields,
         Err(error) => {
             return Ok(ManifestState::RebuildRequired {
+                source_root: source_root.to_path_buf(),
                 actual_version: version,
                 reason: format!(
                     "invalid workspace manifest '{}': {error}",
@@ -182,6 +195,7 @@ pub(crate) fn inspect_workspace_manifest(
         Err(error) if error.code() != EngineError::INVALID_ARGUMENT => return Err(error),
         Err(error) => {
             return Ok(ManifestState::RebuildRequired {
+                source_root: source_root.to_path_buf(),
                 actual_version: version,
                 reason: format!(
                     "invalid workspace manifest '{}': {error}",
@@ -204,14 +218,16 @@ pub(super) fn require_compatible_manifest(
                 return Err(rebuild_required(format!(
                     "invalid workspace manifest '{}': {error}",
                     layout.manifest_path().display()
-                )));
+                ))
+                .with_workspace_root(source_root));
             }
         };
         if let Some(reason) = header.compatibility_error() {
             return Err(rebuild_required(format!(
                 "workspace manifest '{}': {reason}",
                 layout.manifest_path().display()
-            )));
+            ))
+            .with_workspace_root(source_root));
         }
         header.validate_source_root(source_root, layout)?;
     }
@@ -240,7 +256,8 @@ pub(crate) fn write_workspace_manifest(
     manifest: &Workspace,
 ) -> Result<(), EngineError> {
     if manifest.index_enabled() {
-        require_current_index_version(manifest.index_version())?;
+        require_current_index_version(manifest.index_version())
+            .map_err(|error| error.with_workspace_root(manifest.source_root()))?;
     }
     let parent_dir = manifest_home(path)?;
     ensure_directory(parent_dir)?;

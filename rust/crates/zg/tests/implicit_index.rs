@@ -712,6 +712,70 @@ fn incompatible_index_errors_are_actionable_without_rebuilding_existing_data() {
     }
 }
 
+#[test]
+fn incompatible_parent_index_recovery_targets_the_discovered_workspace() {
+    for mode in ["direct", "server"] {
+        let mut fixture = Fixture::new();
+        let workspace = fixture.root.path().join("project's workspace $root");
+        let child = workspace.join("src");
+        let index_home = workspace.join(".zvec-grep");
+        fs::create_dir_all(&child).expect("query directory");
+        fs::create_dir_all(&index_home).expect("parent index directory");
+        let manifest_path = index_home.join("manifest.json");
+        let manifest = br#"{"indexVersion":1}"#;
+        fs::write(&manifest_path, manifest).expect("incompatible parent manifest");
+        let sentinel_path = index_home.join("original-index-data");
+        fs::write(&sentinel_path, b"original").expect("existing index data");
+        let resolved = fs::canonicalize(&workspace).expect("canonical index root");
+        let displayed = zg_cli::output_path(&resolved).display().to_string();
+        if mode == "server" {
+            fixture.start_server();
+        }
+
+        for action in [vec!["--fts", "needle"], vec!["needle"]] {
+            let mut arguments = vec!["--mode", mode, "--color", "never"];
+            arguments.extend(action);
+            let output = fixture
+                .command(&arguments)
+                .current_dir(&child)
+                .output()
+                .expect("access parent index from child");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{mode}: {stderr}");
+            assert!(
+                stderr.contains(&format!("Rebuild the index for {displayed} to continue")),
+                "{mode}: {stderr}"
+            );
+            let command = stderr
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("zg --index --rebuild "))
+                .expect("rebuild command has an explicit index directory");
+            #[cfg(unix)]
+            {
+                // Interpret the displayed shell syntax without running a real rebuild.
+                let script = format!("set -- {command}; test \"$#\" -eq 1 && printf '%s' \"$1\"");
+                let parsed = Command::new("/bin/sh")
+                    .args(["-c", &script])
+                    .output()
+                    .expect("parse recovery argument");
+                assert!(parsed.status.success(), "{command}");
+                assert_eq!(String::from_utf8_lossy(&parsed.stdout), displayed);
+            }
+            #[cfg(windows)]
+            assert_eq!(command, format!("'{}'", displayed.replace('\'', "''")));
+            assert_eq!(
+                fs::read(&manifest_path).expect("manifest retained"),
+                manifest
+            );
+            assert_eq!(
+                fs::read(&sentinel_path).expect("data retained"),
+                b"original"
+            );
+            assert!(!child.join(".zvec-grep").exists());
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn configured_local_models_follow_environment_then_global_default_precedence() {
