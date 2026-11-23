@@ -6,8 +6,9 @@ use crate::{
         options::{ContextRoute, ContextRouteMode},
     },
     domain::{
-        Content, Entity, EntityFragment, EntityId, FileIndexStatus, FileRecord, FileSnapshot,
-        FragmentId, IndexDescriptor, IndexState, Range, SourcePath, Workspace,
+        Content, ContentIndex, ContentKind, Entity, EntityFragment, EntityId, FileIndexStatus,
+        FileRecord, FileSnapshot, FragmentId, IndexDescriptor, IndexState, Range, SourcePath,
+        Workspace,
         model::{EmbeddingMetric, EmbeddingModelInfo, ModelInfo},
     },
     models::ModelRuntimeManager,
@@ -125,7 +126,13 @@ fn write_unclosed_text(
     let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         graph_enabled: false,
         storage_path: storage_home.to_path_buf(),
-        embeddings: vec![schema()],
+        indexes: ContentKind::INDEXED
+            .into_iter()
+            .map(|kind| ContentIndex {
+                kind,
+                embedding: schema(),
+            })
+            .collect(),
     })
     .expect("writable storage");
     let relative_path = SourcePath::new("source.txt").expect("source path");
@@ -174,7 +181,7 @@ fn write_unclosed_text(
             &[IndexedFragment {
                 entity_id,
                 fragment_id,
-                model: schema().model().reference(),
+                kind: ContentKind::Text,
                 vector: vec![1.0, 0.0, 0.0],
                 fts_text: text.into(),
             }],
@@ -301,7 +308,7 @@ fn sequential_and_concurrent_queries_reuse_the_session() {
                 assert_eq!(
                     lease
                         .storage()
-                        .search_fts("orchard", 10, None)
+                        .search_fts(ContentKind::Text, "orchard", 10, None)
                         .expect("search")
                         .len(),
                     1
@@ -442,7 +449,7 @@ fn generation_replacement_and_shutdown_preserve_inflight_readers() {
     assert_eq!(
         first
             .storage()
-            .search_fts("orchard", 10, None)
+            .search_fts(ContentKind::Text, "orchard", 10, None)
             .expect("old reader")
             .len(),
         1
@@ -450,7 +457,7 @@ fn generation_replacement_and_shutdown_preserve_inflight_readers() {
     assert_eq!(
         second
             .storage()
-            .search_fts("vineyard", 10, None)
+            .search_fts(ContentKind::Text, "vineyard", 10, None)
             .expect("new reader")
             .len(),
         1
@@ -489,14 +496,14 @@ fn writes_invalidate_every_local_cache_and_next_query_sees_changes() {
         assert!(
             lease
                 .storage()
-                .search_fts("orchard", 10, None)
+                .search_fts(ContentKind::Text, "orchard", 10, None)
                 .expect("old text removed")
                 .is_empty()
         );
         assert_eq!(
             lease
                 .storage()
-                .search_fts("vineyard", 10, None)
+                .search_fts(ContentKind::Text, "vineyard", 10, None)
                 .expect("new text visible")
                 .len(),
             1
@@ -527,7 +534,7 @@ fn failed_open_can_be_retried_without_leaking_a_residency_lock() {
     assert_eq!(
         lease
             .storage()
-            .search_fts("vineyard", 10, None)
+            .search_fts(ContentKind::Text, "vineyard", 10, None)
             .expect("query")
             .len(),
         1
@@ -677,7 +684,7 @@ fn cold_open_does_not_block_another_workspaces_cache_hit() {
                 .send(
                     lease
                         .storage()
-                        .search_fts("orchard", 10, None)
+                        .search_fts(ContentKind::Text, "orchard", 10, None)
                         .expect("warm search")
                         .len(),
                 )

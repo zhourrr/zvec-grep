@@ -25,10 +25,12 @@ pub(crate) use entity::FragmentId;
 pub use glob::GlobRule;
 
 // Indexes.
+pub(crate) use index::ContentIndex;
 pub(crate) use index::FTS_CONFIG;
 pub(crate) use index::FtsConfig;
 pub(crate) use index::IndexDescriptor;
 pub(crate) use index::IndexState;
+pub(crate) use index::deserialize_unique_map;
 
 // Metadata.
 pub use metadata::CodeMetadata;

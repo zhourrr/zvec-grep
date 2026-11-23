@@ -13,6 +13,8 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
+    pub(crate) const INDEXED: [Self; 2] = [Self::Text, Self::Code];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
