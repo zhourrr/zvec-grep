@@ -49,7 +49,7 @@ use zg_engine::{
         index::{
             IndexOptions,
             options::{
-                Device, EmbeddingModelSpec, GlobRule, ScanRules, ScanRulesUpdate,
+                ContentKind, Device, EmbeddingModelSpec, GlobRule, ScanRules, ScanRulesUpdate,
                 deserialize_optional_update,
             },
         },
@@ -935,6 +935,9 @@ pub struct SearchInput {
     pub included_formats: Option<PathListInput>,
     /// Exclude matching file-name formats, taking precedence over included formats.
     pub excluded_formats: Option<PathListInput>,
+    /// Target content collections. Omit to search all enabled kinds.
+    #[serde(default)]
+    pub kinds: Vec<KindInput>,
     /// Categories inferred from indexed file names, such as code or document.
     pub categories: Option<PathListInput>,
     /// Exclude matching file-name categories, taking precedence over categories.
@@ -991,9 +994,11 @@ pub struct IndexInput {
     /// Permanently remove the workspace index.
     #[schemars(extend("type" = "boolean"))]
     pub drop: Option<bool>,
-    /// Single embedding model for this workspace; this version indexes text only.
+    /// Default embedding model for this workspace.
     #[schemars(length(min = 1, max = 256))]
     pub embedding: Option<String>,
+    /// Per-kind model overrides. The value "default" restores inheritance.
+    pub embedding_routes: Option<EmbeddingRoutesInput>,
     /// Explicitly rebuild the existing index.
     #[schemars(extend("type" = "boolean"))]
     pub rebuild: Option<bool>,
@@ -1297,6 +1302,7 @@ struct WorkspaceIndexOutput {
     root_paths: Vec<RootSpecOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding: Option<IndexedEmbeddingOutput>,
+    content_indexes: Vec<ContentIndexOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fts: Option<IndexedFtsOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1330,6 +1336,13 @@ struct RootSpecOutput {
     max_file_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "is_false")]
     follow: bool,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct ContentIndexOutput {
+    kind: String,
+    embedding: IndexedEmbeddingOutput,
+    inherited: bool,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -1475,6 +1488,29 @@ pub enum DeviceInput {
     Metal,
     Vulkan,
     Cuda,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum KindInput {
+    Text,
+    Code,
+}
+
+impl From<KindInput> for ContentKind {
+    fn from(value: KindInput) -> Self {
+        match value {
+            KindInput::Text => Self::Text,
+            KindInput::Code => Self::Code,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingRoutesInput {
+    pub text: Option<String>,
+    pub code: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
@@ -1741,6 +1777,7 @@ impl SearchInput {
             self.auto_update || matches!(self.freshness, FreshnessInput::WaitForFresh);
 
         let request = ContextOptions {
+            target_kinds: self.kinds.into_iter().map(Into::into).collect(),
             query: None,
             root: Some(root.clone()),
             queries,
@@ -1828,18 +1865,7 @@ impl IndexInput {
                 include_counts: false,
             }));
         }
-        if let Some(api_key) = &self.api_key {
-            validate_text("apiKey", api_key, 1, 8_192)?;
-        }
-        if let Some(endpoint) = &self.endpoint {
-            validate_text("endpoint", endpoint, 1, 2_048)?;
-            let valid = endpoint.parse::<http::Uri>().is_ok_and(|uri| {
-                matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
-            });
-            if !valid {
-                return Err("endpoint must be an absolute HTTP(S) URL".to_owned());
-            }
-        }
+        self.validate_connection()?;
 
         let glob_update = normalize_index_globs(self.globs, self.insensitive_globs)?;
         let scan = ScanRulesUpdate {
@@ -1876,8 +1902,36 @@ impl IndexInput {
         } else {
             None
         };
+        let routes = self.embedding_routes.unwrap_or_default();
+        let mut embedding_routes = std::collections::BTreeMap::new();
+        let mut clear_embedding_routes = Vec::new();
+        for (kind, entry) in [
+            (ContentKind::Text, routes.text),
+            (ContentKind::Code, routes.code),
+        ] {
+            if let Some(entry) = entry {
+                let reference = entry.trim();
+                validate_text("embeddingRoutes", reference, 1, 256)?;
+                if reference == "default" {
+                    clear_embedding_routes.push(kind);
+                } else {
+                    embedding_routes.insert(
+                        kind,
+                        EmbeddingModelSpec {
+                            reference: reference.to_owned(),
+                            revision: None,
+                            cache_dir: None,
+                            endpoint: None,
+                            device: self.device.map_or(Device::Auto, Into::into),
+                        },
+                    );
+                }
+            }
+        }
         Ok(IndexToolRequest::Index {
             options: Box::new(IndexOptions {
+                embedding_routes,
+                clear_embedding_routes,
                 root: Some(root),
                 rebuild: self.rebuild.unwrap_or(false),
                 graph_indexing: self.graph_indexing,
@@ -1895,11 +1949,28 @@ impl IndexInput {
         })
     }
 
+    fn validate_connection(&self) -> Result<(), String> {
+        if let Some(api_key) = &self.api_key {
+            validate_text("apiKey", api_key, 1, 8_192)?;
+        }
+        if let Some(endpoint) = &self.endpoint {
+            validate_text("endpoint", endpoint, 1, 2_048)?;
+            let valid = endpoint.parse::<http::Uri>().is_ok_and(|uri| {
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+            });
+            if !valid {
+                return Err("endpoint must be an absolute HTTP(S) URL".to_owned());
+            }
+        }
+        Ok(())
+    }
+
     fn has_index_options(&self) -> bool {
         self.api_key.is_some()
             || self.device.is_some()
             || self.endpoint.is_some()
             || self.embedding.is_some()
+            || self.embedding_routes.is_some()
             || self.rebuild.is_some()
             || self.graph_indexing.is_some()
             || self.reset_paths.is_some()
@@ -2348,12 +2419,16 @@ impl From<InfoResult> for IndexStatusOutput {
             root: output_path(&info.root).display().to_string(),
             path: output_path(&info.path).display().to_string(),
             root_paths: vec![RootSpecOutput::new(&info.root, &info.scan)],
-            embedding: info.embedding.map(|embedding| IndexedEmbeddingOutput {
-                provider: embedding.provider,
-                model: embedding.model,
-                dimension: embedding.dimension,
-                metric: embedding.metric,
-            }),
+            embedding: info.embedding.map(IndexedEmbeddingOutput::from),
+            content_indexes: info
+                .content_indexes
+                .into_iter()
+                .map(|index| ContentIndexOutput {
+                    kind: index.kind.as_str().to_owned(),
+                    embedding: index.embedding.into(),
+                    inherited: index.inherited,
+                })
+                .collect(),
             fts: info.fts.map(|fts| IndexedFtsOutput {
                 tokenizer: fts.tokenizer,
                 filters: fts.filters,
@@ -2495,6 +2570,17 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
         IndexOperationState::Succeeded => IndexJobState::Succeeded,
         IndexOperationState::Failed => IndexJobState::Failed,
         IndexOperationState::Cancelled => IndexJobState::Cancelled,
+    }
+}
+
+impl From<zg_engine::api::info::result::WorkspaceIndexEmbedding> for IndexedEmbeddingOutput {
+    fn from(embedding: zg_engine::api::info::result::WorkspaceIndexEmbedding) -> Self {
+        Self {
+            provider: embedding.provider,
+            model: embedding.model,
+            dimension: embedding.dimension,
+            metric: embedding.metric,
+        }
     }
 }
 
@@ -2663,6 +2749,7 @@ mod tests {
             excluded_file_types: None,
             included_formats: None,
             excluded_formats: None,
+            kinds: Vec::new(),
             categories: None,
             excluded_categories: None,
 
@@ -2758,7 +2845,7 @@ mod tests {
                 indexed: false,
                 compatibility: super::IndexCompatibility::RebuildRequired {
                     actual_version,
-                    expected_version: 2,
+                    expected_version: 3,
                     reason: "unsupported persisted index".into(),
                 },
                 index_policy: super::WorkspaceIndexPolicy::Enabled,
@@ -2777,7 +2864,7 @@ mod tests {
                 serde_json::json!({
                     "status": "rebuild_required",
                     "actual_version": actual_version,
-                    "expected_version": 2,
+                    "expected_version": 3,
                     "reason": "unsupported persisted index",
                 })
             );
@@ -2806,10 +2893,11 @@ mod tests {
             index_path: root.join(".zvec-grep/index"),
             root: root.clone(),
             indexed: true,
-            compatibility: super::IndexCompatibility::Compatible { version: 2 },
+            compatibility: super::IndexCompatibility::Compatible { version: 3 },
             index_policy: super::WorkspaceIndexPolicy::Enabled,
             source: super::InfoSource::Index,
             workspace_index: Some(WorkspaceIndexInfo {
+                content_indexes: Vec::new(),
                 path: root.join(".zvec-grep"),
                 root,
                 scan: super::ScanRules::default(),
@@ -2819,7 +2907,7 @@ mod tests {
                     tokenizer: "jieba".into(),
                     filters: vec!["lowercase".into()],
                 }),
-                index_version: Some(2),
+                index_version: Some(3),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             }),
@@ -2837,7 +2925,7 @@ mod tests {
         let files = &output["persistent"]["files"];
         assert_eq!(
             output["compatibility"],
-            serde_json::json!({"status": "compatible", "version": 2})
+            serde_json::json!({"status": "compatible", "version": 3})
         );
         let workspace = &output["persistent"]["workspace_index"];
         assert!(workspace.get("name").is_none());
@@ -3089,17 +3177,18 @@ mod tests {
             index_path: root.join(".zvec-grep/index"),
             root: root.clone(),
             indexed: true,
-            compatibility: super::IndexCompatibility::Compatible { version: 2 },
+            compatibility: super::IndexCompatibility::Compatible { version: 3 },
             index_policy: super::WorkspaceIndexPolicy::Enabled,
             source: super::InfoSource::Index,
             workspace_index: Some(WorkspaceIndexInfo {
+                content_indexes: Vec::new(),
                 path: root.join(".zvec-grep"),
                 root,
                 scan,
                 policy: super::WorkspaceIndexPolicy::Enabled,
                 embedding: None,
                 fts: None,
-                index_version: Some(2),
+                index_version: Some(3),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             }),
@@ -3196,17 +3285,18 @@ mod tests {
                     index_path: home.join("index"),
                     home: home.clone(),
                     indexed: true,
-                    compatibility: super::IndexCompatibility::Compatible { version: 2 },
+                    compatibility: super::IndexCompatibility::Compatible { version: 3 },
                     index_policy: super::WorkspaceIndexPolicy::Enabled,
                     source: super::InfoSource::Index,
                     workspace_index: Some(WorkspaceIndexInfo {
+                        content_indexes: Vec::new(),
                         root,
                         path: home,
                         scan: super::ScanRules::default(),
                         policy: super::WorkspaceIndexPolicy::Enabled,
                         embedding: None,
                         fts: None,
-                        index_version: Some(2),
+                        index_version: Some(3),
                         created_epoch_ms: 1,
                         updated_epoch_ms: 2,
                     }),
@@ -3535,10 +3625,11 @@ mod tests {
     }
 
     #[test]
-    fn index_input_accepts_one_model_and_rejects_model_routes() {
+    fn index_input_resolves_default_and_kind_assignments() {
         let parsed: IndexInput = serde_json::from_value(serde_json::json!({
             "root": test_root(),
             "embedding": "local/potion-code-16m-v2",
+            "embeddingRoutes": {"code":"local/jina-embeddings-v2-base-code","text":"default"},
             "device": "cpu"
         }))
         .expect("single model input");
@@ -3547,14 +3638,17 @@ mod tests {
         else {
             panic!("index");
         };
+        assert_eq!(
+            options.embedding_routes[&super::ContentKind::Code].reference,
+            "local/jina-embeddings-v2-base-code"
+        );
+        assert_eq!(options.clear_embedding_routes, [super::ContentKind::Text]);
         let model = options.embedding.expect("selected model");
         assert_eq!(model.reference, "local/potion-code-16m-v2");
         assert_eq!(model.device, super::Device::Cpu);
 
         for patch in [
-            serde_json::json!({"embeddingRoutes": {"text":"one"}}),
-            serde_json::json!({"embeddingRoutes": {}}),
-            serde_json::json!({"embedding":"one", "embeddingRoutes":{"text":"two"}}),
+            serde_json::json!({"embeddingRoutes": {"image":"one"}}),
             serde_json::json!({"embedding":["one", "two"]}),
         ] {
             let mut value = patch;
@@ -3564,7 +3658,7 @@ mod tests {
         let schema =
             serde_json::to_value(schemars::schema_for!(IndexInput)).expect("index input schema");
         assert!(schema["properties"].get("embedding").is_some());
-        assert!(schema["properties"].get("embeddingRoutes").is_none());
+        assert!(schema["properties"].get("embeddingRoutes").is_some());
         assert!(schema["properties"].get("includeHidden").is_some());
         assert!(schema["properties"].get("hidden").is_none());
         assert!(schema["properties"].get("useDefaultIgnores").is_some());
@@ -4131,6 +4225,7 @@ mod tests {
             device: None,
             endpoint: None,
             drop: None,
+            embedding_routes: None,
             embedding: Some("potion-base-8M".to_owned()),
             rebuild: Some(false),
             reset_paths: None,

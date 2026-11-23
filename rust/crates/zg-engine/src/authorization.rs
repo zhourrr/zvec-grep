@@ -77,46 +77,53 @@ fn authorizations_for_manifest(
     root: &Path,
     existing: Option<&Workspace>,
 ) -> Result<Vec<IndexAuthorization>, EngineError> {
-    Ok(authorization_for_manifest(options, root, existing)?
-        .into_iter()
-        .collect())
-}
-
-fn authorization_for_manifest(
-    options: &crate::api::index::IndexOptions,
-    workspace_root: &Path,
-    existing: Option<&Workspace>,
-) -> Result<Option<IndexAuthorization>, EngineError> {
-    let Some(selection) =
-        crate::pipelines::indexing::embedding_policy::configured_selection(existing, options)?
-    else {
-        // Scene-based defaults only select local models and need no remote grant.
-        return Ok(None);
-    };
-    let model = selection.model;
-    if options.allow_remote || model.starts_with("local/") {
-        return Ok(None);
-    }
-    let endpoint = remote_endpoint(
-        &model,
-        options
+    use crate::pipelines::indexing::{embedding_policy, embedding_requests};
+    // Automatic defaults are local, but an explicit per-kind route can still be remote.
+    let default_ref = embedding_policy::configured_selection(existing, options)?.map_or_else(
+        || "local/potion-code-16m-v2".to_owned(),
+        |selection| selection.model,
+    );
+    let mut targets = Vec::new();
+    for (model, request) in embedding_requests(existing, options, default_ref)? {
+        let saved = existing
+            .and_then(|workspace| workspace.index().descriptor())
+            .and_then(|index| index.embedding_configs().get(&model));
+        let endpoint = request
             .endpoint
             .as_deref()
             .or_else(|| {
-                options
+                request
                     .embedding
                     .as_ref()
-                    .and_then(|e| e.endpoint.as_deref())
+                    .and_then(|spec| spec.endpoint.as_deref())
             })
-            .or_else(|| {
-                existing
-                    .and_then(|m| m.index().descriptor())
-                    .and_then(|index| index.embedding_configs().get(&model))
-                    .and_then(|runtime| runtime.endpoint.as_deref())
-            }),
-    )?;
+            .or_else(|| saved.and_then(|config| config.endpoint.as_deref()));
+        if let Some(target) = authorization_for_model(
+            root,
+            &model,
+            endpoint,
+            options.allow_remote,
+            &options.authorized_remote,
+        )? {
+            targets.push(target);
+        }
+    }
+    Ok(targets)
+}
+
+fn authorization_for_model(
+    workspace_root: &Path,
+    model: &str,
+    endpoint: Option<&str>,
+    allow_remote: bool,
+    authorized_remote: &[IndexAuthorization],
+) -> Result<Option<IndexAuthorization>, EngineError> {
+    if allow_remote || model.starts_with("local/") {
+        return Ok(None);
+    }
+    let endpoint = remote_endpoint(model, endpoint)?;
     let root = fs::canonicalize(workspace_root).map_err(io)?;
-    if approved_destination(&root, &model, &endpoint, &options.authorized_remote)
+    if approved_destination(&root, model, &endpoint, authorized_remote)
         || read_grants(&root)?
             .iter()
             .any(|g| g.model == model && g.endpoint == endpoint)
@@ -130,7 +137,7 @@ fn authorization_for_manifest(
     Ok(Some(IndexAuthorization {
         root,
         workspace_roots,
-        model,
+        model: model.to_owned(),
         endpoint,
         endpoint_host,
     }))
@@ -167,6 +174,7 @@ pub fn query_authorizations(
     options: &crate::api::context::ContextOptions,
 ) -> Result<Vec<QueryAuthorization>, EngineError> {
     use crate::api::context::options::{ContextRouteMode, RefreshPolicy};
+    options.validate_index_targets()?;
     if options.rg {
         return Ok(Vec::new());
     }
@@ -185,40 +193,55 @@ pub fn query_authorizations(
     let Some(manifest) = read_workspace_manifest(&root, &layout)? else {
         return Ok(Vec::new());
     };
-    if manifest.index().descriptor().is_none() {
+    let Some(index) = manifest.index().descriptor() else {
         return Ok(Vec::new());
-    }
+    };
     if options.allow_remote || (!query_text && !workspace_content) {
         return Ok(Vec::new());
     }
     let mut authorizations: Vec<QueryAuthorization> = Vec::new();
-    for (enabled, endpoint, sends_query) in [
-        (query_text, options.endpoint.clone(), true),
-        (workspace_content, None, false),
-    ] {
-        if !enabled {
+    for sends_query in [true, false] {
+        let targets = if sends_query && query_text {
+            crate::pipelines::indexed_search::service::query_targets(index, options)?
+        } else if !sends_query && workspace_content {
+            index.content_indexes()
+        } else {
             continue;
-        }
-        let targets = authorizations_for_manifest(
-            &crate::api::index::IndexOptions {
-                root: Some(root.clone()),
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for table in targets {
+            let model = table.embedding.model().reference();
+            if !seen.insert(model.clone()) {
+                continue;
+            }
+            let saved = index
+                .embedding_configs()
+                .get(&model)
+                .and_then(|config| config.endpoint.as_deref());
+            let endpoint =
+                if sends_query && model == index.default_embedding_model().model().reference() {
+                    options.endpoint.as_deref().or(saved)
+                } else {
+                    saved
+                };
+            if let Some(target) = authorization_for_model(
+                &root,
+                &model,
                 endpoint,
-                authorized_remote: options.authorized_remote.clone(),
-                ..crate::api::index::IndexOptions::default()
-            },
-            &root,
-            Some(&manifest),
-        )?;
-        for target in targets {
-            if let Some(previous) = authorizations.iter_mut().find(|item| item.target == target) {
-                previous.query_text |= sends_query;
-                previous.workspace_content |= !sends_query;
-            } else {
-                authorizations.push(QueryAuthorization {
-                    target,
-                    query_text: sends_query,
-                    workspace_content: !sends_query,
-                });
+                options.allow_remote,
+                &options.authorized_remote,
+            )? {
+                if let Some(previous) = authorizations.iter_mut().find(|item| item.target == target)
+                {
+                    previous.query_text |= sends_query;
+                    previous.workspace_content |= !sends_query;
+                } else {
+                    authorizations.push(QueryAuthorization {
+                        target,
+                        query_text: sends_query,
+                        workspace_content: !sends_query,
+                    });
+                }
             }
         }
     }
@@ -1058,6 +1081,36 @@ mod tests {
         );
     }
 
+    fn model_spec(reference: &str) -> EmbeddingModelSpec {
+        EmbeddingModelSpec {
+            reference: reference.into(),
+            revision: None,
+            cache_dir: None,
+            endpoint: None,
+            device: Device::Auto,
+        }
+    }
+
+    fn assert_local_query_scope(request: &crate::api::context::ContextOptions) {
+        use crate::api::context::{ContextOptions, options::RefreshPolicy};
+        let local_only = ContextOptions {
+            target_kinds: vec![crate::domain::ContentKind::Code],
+            ..request.clone()
+        };
+        assert!(
+            query_authorizations(&local_only)
+                .expect("local code query")
+                .is_empty()
+        );
+        let refresh = query_authorizations(&ContextOptions {
+            refresh: Some(RefreshPolicy::Wait),
+            ..local_only
+        })
+        .expect("refresh destinations");
+        assert_eq!(refresh.len(), 1);
+        assert!(refresh[0].workspace_content && !refresh[0].query_text);
+    }
+
     #[tokio::test]
     async fn query_disclosure_uses_index_destination_and_actual_refresh_policy() {
         use crate::api::context::{
@@ -1071,13 +1124,12 @@ mod tests {
                 root: Some(directory.path().into()),
                 allow_remote: true,
                 api_key: Some("test-key".into()),
-                embedding: Some(EmbeddingModelSpec {
-                    reference: "qwen/text-embedding-v4".into(),
-                    revision: None,
-                    cache_dir: None,
-                    endpoint: None,
-                    device: Device::Auto,
-                }),
+                embedding: Some(model_spec("qwen/text-embedding-v4")),
+                embedding_routes: [(
+                    crate::domain::ContentKind::Code,
+                    model_spec("local/potion-code-16m-v2"),
+                )]
+                .into(),
                 endpoint: Some("https://query.test/embeddings".into()),
                 ..IndexOptions::default()
             })
@@ -1094,6 +1146,7 @@ mod tests {
             refresh: Some(RefreshPolicy::Off),
             ..ContextOptions::default()
         };
+        assert_local_query_scope(&request);
         let plan = query_authorization(&request)
             .expect("preflight")
             .expect("consent");
@@ -1166,13 +1219,7 @@ mod tests {
         engine
             .index(IndexOptions {
                 root: Some(root.clone()),
-                embedding: Some(EmbeddingModelSpec {
-                    reference: "qwen/text-embedding-v4".into(),
-                    revision: None,
-                    cache_dir: None,
-                    endpoint: None,
-                    device: Device::Auto,
-                }),
+                embedding: Some(model_spec("qwen/text-embedding-v4")),
                 api_key: Some("test-key".into()),
                 endpoint: Some("https://provider.test/embeddings".into()),
                 allow_remote: true,

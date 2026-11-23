@@ -10,6 +10,9 @@ use crate::domain::{Range, TextRange};
 /// from ordinary results; transports decide how to deliver the diagnostic data.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct StageTrace {
+    /// Kind tables searched by this query group and score space.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<crate::api::context::options::ContentKind>,
     pub(crate) version: u32,
     pub(crate) group_id: String,
     pub(crate) limit: usize,

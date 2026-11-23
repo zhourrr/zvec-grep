@@ -381,14 +381,14 @@ It rotates at 10 MiB and keeps five numbered backups by default. The global
 are written to `<home>/daemon/bootstrap.log`.
 
 The instance record at `<home>/daemon/instance.lock` carries
-`daemonProtocolVersion: 2`. Existing v2 requests remain compatible. Setup replies
+`daemonProtocolVersion: 3`. Restart older daemons to use content-kind collections. Setup replies
 advertise `supports_embedding_defaults`; clients check it before sending the optional
 `embedding_default` indexing/authorization field. A daemon without this capability
 receives only the original read-only setup request, and the client asks for a restart
 before submitting indexing. Explicit model requests and requests without a caller
 default retain their original shape. Update the daemon to enable the new policy for
 MCP and caller defaults. Status checks and daemon-backed
-CLI requests reject live legacy daemons without this field or with version 1,
+CLI requests reject live legacy daemons without this field or with version 1 or 2,
 including Node.js daemons; `auto` mode
 does not silently fall back to direct execution. Run `zg --server on` with the
 same home and any required token file to stop the legacy daemon and start Rust.
@@ -486,21 +486,33 @@ search. These queries do not load models or refresh the index.
 Graph extraction and resolution must have populated the index for call edges to
 be available; unresolved references are excluded from results.
 
-This version indexes text and code with one embedding model per workspace. Choose
-it with `zg --index --embedding <model>` or set a default with
-`zg --config model set <model> --default`. Code, documents and structured text use
-that same model and retrieval collection. Code has its own content payload kind.
-Images and other unsupported sources are reported as skipped; multimodal content
-and per-content model routing are not supported. Changing the model requires
-`zg --index --rebuild --embedding <model>`.
+Text and code each have their own search collection and can use different models.
+A bare `--embedding MODEL` sets the workspace default. Repeat the option with
+`text=MODEL` or `code=MODEL` to pin a kind. Use `code=default` or `text=default`
+to restore inheritance. Omitted settings preserve saved choices. Use `zg --status`
+to see the effective models and whether each kind inherits the default.
+
+```sh
+zg --index --embedding local/all-minilm-l6-v2 --embedding code=local/potion-code-16m-v2
+zg --vector "how does login work?" --kind text
+zg --vector "how does login work?" --kind code
+zg --vector "how does login work?"
+```
+
+`--kind` selects an indexed content collection. `--category` filters source files.
+An unqualified semantic search queries both enabled kinds. Compatible text and
+code embeddings share a ranked list. Different embedding spaces produce labeled
+groups with a single total result limit. Pure full-text queries with refresh off
+do not load embedding models. To change an existing collection's model, use
+`zg --index --rebuild` with the new model assignment. Index v2 requires an explicit rebuild.
 
 Each entity stores one complete source content object, its location in the source
 file, metadata, and its fragments. Each text fragment has a unique ID and selects
 either full content or UTF-8 byte offsets relative to the entity's content. Source
 locations, including line and column numbers, are calculated when needed;
 fragments do not duplicate content or source coordinates.
-Model collections store the text and vectors needed for retrieval, with entity
-metadata included in search projections. Index format 2 uses this layout.
+Content-kind collections store the text and vectors needed for retrieval, with entity
+metadata included in search projections. Index format 3 uses this layout.
 
 Lexical search runs in-process with ripgrep's `grep` and `ignore` crates; the
 binary and ordinary CI jobs do not require a system `rg` executable.
@@ -684,7 +696,7 @@ The required field changes the internal daemon reply contract. Native ripgrep
 type filters apply to queries; persisted scan rules support path globs and file
 formats using the same filename rules as indexed queries. The daemon wire
 distinguishes complete ordered glob replacement from case-category updates.
-The instance record uses `daemonProtocolVersion: 2`; see the daemon migration
+The instance record uses `daemonProtocolVersion: 3`; see the daemon migration
 notes above when replacing older resident processes. Replies without
 `content_range` are rejected during deserialization. Direct and server rendering
 consume the same engine contract.

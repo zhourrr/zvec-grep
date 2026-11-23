@@ -11,7 +11,7 @@ use zg_engine::api::context::{
     ContextResult,
     result::{
         ContentRange, ContextCoverage, ContextItem, ContextItemKind, ContextItemStatus,
-        EmptyReason, EntityMetadata,
+        EmptyReason, EntityMetadata, IndexResultGroup,
     },
 };
 
@@ -39,7 +39,14 @@ pub(super) fn write(
         {
             return writeln!(writer, "No searchable files.");
         }
-        return write_items(writer, &result.items, &result.query, options, theme);
+        let groups = result
+            .diagnostics
+            .index
+            .as_ref()
+            .map_or(&[][..], |index| index.result_groups.as_slice());
+        return write_rank_groups(writer, &result.items, groups, |writer, items| {
+            write_items(writer, items, &result.query, options, theme)
+        });
     }
     let groups = result
         .group_results
@@ -67,7 +74,49 @@ pub(super) fn write(
                 )
             )?;
         }
-        write_items(writer, &group.items, &group.query, options, theme)?;
+        write_rank_groups(
+            writer,
+            &group.items,
+            &group.result_groups,
+            |writer, items| write_items(writer, items, &group.query, options, theme),
+        )?;
+    }
+    Ok(())
+}
+
+/// Distances from incompatible embedding spaces have independent ranks.
+fn write_rank_groups<W: Write>(
+    writer: &mut W,
+    items: &[ContextItem],
+    groups: &[IndexResultGroup],
+    mut render: impl FnMut(&mut W, &[ContextItem]) -> io::Result<()>,
+) -> io::Result<()> {
+    if groups.iter().filter(|group| group.item_count > 0).count() <= 1 {
+        return render(writer, items);
+    }
+    for (index, group) in groups
+        .iter()
+        .filter(|group| group.item_count > 0)
+        .enumerate()
+    {
+        let end = group.item_start.saturating_add(group.item_count);
+        let slice = items.get(group.item_start..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "search result group exceeds the returned hits",
+            )
+        })?;
+        if index > 0 {
+            writeln!(writer)?;
+        }
+        let kinds = group
+            .kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        writeln!(writer, "{kinds} results")?;
+        render(writer, slice)?;
     }
     Ok(())
 }
@@ -293,10 +342,22 @@ fn write_detail(
                 )?;
             }
             let highlighter = QueryHighlighter::new(&group.query, theme.color);
-            write_detail_items(writer, &group.items, options, theme, &highlighter)?;
+            write_rank_groups(
+                writer,
+                &group.items,
+                &group.result_groups,
+                |writer, items| write_detail_items(writer, items, options, theme, &highlighter),
+            )?;
         }
     } else {
-        write_detail_items(writer, &result.items, options, theme, &highlighter)?;
+        let groups = result
+            .diagnostics
+            .index
+            .as_ref()
+            .map_or(&[][..], |index| index.result_groups.as_slice());
+        write_rank_groups(writer, &result.items, groups, |writer, items| {
+            write_detail_items(writer, items, options, theme, &highlighter)
+        })?;
     }
     Ok(())
 }

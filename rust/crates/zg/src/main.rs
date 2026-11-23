@@ -984,11 +984,6 @@ async fn authorize_query_with_io(
             }
         }
     }
-    // A single remote query destination can retain the legacy binding. Multiple
-    // models keep their individual saved endpoints instead of a global override.
-    if targets.len() == 1 {
-        request.authorization_model = Some(targets[0].target.model.clone());
-    }
     Ok(())
 }
 
@@ -1563,6 +1558,7 @@ mod status_diagnostics_tests {
             index_path: "/workspace/.zvec-grep/index".into(),
             source: InfoSource::Index,
             workspace_index: Some(WorkspaceIndexInfo {
+                content_indexes: Vec::new(),
                 path: "/workspace/.zvec-grep".into(),
                 root: "/workspace".into(),
                 scan: zg_engine::api::index::options::ScanRules::default(),
@@ -1782,8 +1778,8 @@ mod query_authorization_tests {
         assert_eq!(once.authorized_remote.len(), 1);
         assert_eq!(once.authorized_remote[0].model, "qwen/text-embedding-v4");
         assert_eq!(
-            once.authorization_model.as_deref(),
-            Some("qwen/text-embedding-v4")
+            once.authorized_remote[0].endpoint,
+            "https://query.test/embeddings"
         );
         assert!(!root.join(".zvec-grep/authorization.json").exists());
         assert!(

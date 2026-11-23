@@ -1,3 +1,5 @@
+#[path = "server_lifecycle/content_kinds.rs"]
+mod content_kinds;
 #[path = "server_lifecycle/mcp_parity.rs"]
 mod mcp_parity;
 #[path = "server_lifecycle/relationships.rs"]

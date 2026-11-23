@@ -37,6 +37,7 @@ pub use stdio::stdout;
 pub use terminal::{stderr_supports_ansi, stdout_supports_ansi};
 
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     str::FromStr,
@@ -56,7 +57,7 @@ use zg_engine::api::{
     files::FilesOptions,
     index::{
         IndexOptions,
-        options::{Device, EmbeddingModelSpec, GlobRule, ScanRulesUpdate},
+        options::{ContentKind, Device, EmbeddingModelSpec, GlobRule, ScanRulesUpdate},
     },
     info::InfoOptions,
     relationships::RelationshipOptions,
@@ -424,6 +425,9 @@ pub struct QueryFileArgs {
     /// Exclude formats inferred from file names; rg mode uses its native type definitions.
     #[arg(short = 'T', long = "type-not", value_name = "FORMAT")]
     pub excluded_file_types: Vec<String>,
+    /// Search these content collections (text or code). Repeat to select both.
+    #[arg(long = "kind", value_name = "KIND", value_parser = parse_kind)]
+    pub kinds: Vec<ContentKind>,
     /// Include categories inferred from indexed file names.
     #[arg(long = "category", value_name = "CATEGORY")]
     pub categories: Vec<String>,
@@ -439,7 +443,10 @@ impl QueryFileArgs {
             return Err(CliError::NestedGitRequiresIndex);
         }
         if request.rg {
-            if !self.categories.is_empty() || !self.excluded_categories.is_empty() {
+            if !self.kinds.is_empty()
+                || !self.categories.is_empty()
+                || !self.excluded_categories.is_empty()
+            {
                 return Err(CliError::RgWithIndexedOptions);
             }
             // Keep the CLI's mixed -g/--iglob order before native parser rules.
@@ -475,6 +482,7 @@ impl QueryFileArgs {
             if scan.has_scan_options() {
                 return Err(CliError::IndexedScanOptions);
             }
+            request.target_kinds.clone_from(&self.kinds);
             request.filter.globs.clone_from(&scan.glob_rules);
             request.filter.included_formats = parse_formats(&self.file_types)?;
             request.filter.excluded_formats = parse_formats(&self.excluded_file_types)?;
@@ -642,9 +650,9 @@ pub struct IndexArgs {
     pub color: Option<ColorMode>,
     #[arg(long, env = "ZVEC_GREP_HOME")]
     pub home: Option<PathBuf>,
-    /// Single embedding model for this workspace; this version indexes text only.
-    #[arg(long)]
-    pub embedding: Option<String>,
+    /// Default model or a per-kind assignment (code=MODEL, text=MODEL, code=default).
+    #[arg(long, value_name = "MODEL|KIND=MODEL")]
+    pub embedding: Vec<String>,
     #[arg(long = "model-cache")]
     pub model_cache: Option<PathBuf>,
     #[arg(long, value_enum, ignore_case = true)]
@@ -826,6 +834,8 @@ pub enum CliError {
     InvalidFileFormat(String),
     #[error("unknown indexed file category: {0}")]
     InvalidFileCategory(String),
+    #[error("invalid --embedding assignment: {0}")]
+    InvalidEmbedding(String),
     #[error("--force-direct requires --mode direct")]
     ForceDirectMode,
     #[error("--json is not supported; use --preview none, short, full, or detail for text output")]
@@ -1338,6 +1348,7 @@ fn query_option_with_value(value: &str) -> bool {
             | "--type"
             | "-t"
             | "--type-not"
+            | "--kind"
             | "--category"
             | "--category-not"
             | "-T"
@@ -1367,6 +1378,7 @@ fn query_attached_option(value: &str) -> bool {
         || value.starts_with("--iglob=")
         || value.starts_with("--type=")
         || value.starts_with("--type-not=")
+        || value.starts_with("--kind=")
         || value.starts_with("--category=")
         || value.starts_with("--category-not=")
         || value.starts_with("--hidden=")
@@ -1619,6 +1631,7 @@ fn uses_path_lookup(args: &QueryArgs) -> bool {
         && !args.trace
         && args.refresh.is_none()
         && args.symbol_types.is_empty()
+        && args.files.kinds.is_empty()
         && args.values.len() == 1
         && is_path_query(&args.values[0])
 }
@@ -1634,6 +1647,75 @@ fn is_path_query(query: &str) -> bool {
                 (1..=12).contains(&extension.len())
                     && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
             }))
+}
+
+fn parse_kind(value: &str) -> Result<ContentKind, String> {
+    match value {
+        "text" => Ok(ContentKind::Text),
+        "code" => Ok(ContentKind::Code),
+        _ => Err(format!(
+            "unknown indexed content kind {value:?}; expected text or code"
+        )),
+    }
+}
+
+struct EmbeddingUpdates {
+    default_model: Option<EmbeddingModelSpec>,
+    routes: BTreeMap<ContentKind, EmbeddingModelSpec>,
+    inherited_kinds: Vec<ContentKind>,
+}
+
+fn parse_embeddings(args: &IndexArgs) -> Result<EmbeddingUpdates, CliError> {
+    let model = |reference: &str| EmbeddingModelSpec {
+        reference: reference.to_owned(),
+        revision: None,
+        cache_dir: args.model_cache.clone(),
+        endpoint: None,
+        device: args.device.unwrap_or(DeviceArg::Auto).into(),
+    };
+    let mut default = None;
+    let mut routes = BTreeMap::new();
+    let mut cleared = Vec::new();
+    for value in &args.embedding {
+        let (kind, reference) = value
+            .split_once('=')
+            .map_or((None, value.as_str()), |(kind, reference)| {
+                (Some(kind), reference)
+            });
+        if reference.trim().is_empty() {
+            return Err(CliError::InvalidEmbedding(format!(
+                "{value:?}; expected MODEL, KIND=MODEL or KIND=default"
+            )));
+        }
+        if let Some(kind) = kind {
+            let kind = parse_kind(kind).map_err(CliError::InvalidEmbedding)?;
+            if routes.contains_key(&kind) || cleared.contains(&kind) {
+                return Err(CliError::InvalidEmbedding(format!(
+                    "duplicate configuration for {}",
+                    kind.as_str()
+                )));
+            }
+            if reference == "default" {
+                cleared.push(kind);
+            } else {
+                routes.insert(kind, model(reference));
+            }
+        } else {
+            if default.is_some() {
+                return Err(CliError::InvalidEmbedding(
+                    "default model specified more than once".to_owned(),
+                ));
+            }
+            let mut spec = model(reference);
+            spec.endpoint.clone_from(&args.endpoint);
+            default = Some(spec);
+        }
+    }
+    Ok(EmbeddingUpdates {
+        default_model: default,
+        routes,
+        inherited_kinds: cleared,
+    })
 }
 
 fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliError> {
@@ -1652,7 +1734,7 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
         if args.rebuild
             || args.graph.is_some()
             || args.reset_paths
-            || args.embedding.is_some()
+            || !args.embedding.is_empty()
             || args.model_cache.is_some()
             || args.device.is_some()
             || args.api_key.is_some()
@@ -1677,6 +1759,7 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             output,
         });
     }
+    let embeddings = parse_embeddings(&args)?;
     let mut scan = args.files.update();
     if !args.file_types.is_empty() {
         scan.included_formats = Some(parse_formats(&args.file_types)?);
@@ -1690,13 +1773,6 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             .map(|path| resolve_from(current_dir, Some(&path)))
             .collect()
     });
-    let embedding = args.embedding.map(|reference| EmbeddingModelSpec {
-        reference,
-        revision: None,
-        cache_dir: args.model_cache.clone(),
-        endpoint: args.endpoint.clone(),
-        device: args.device.unwrap_or(DeviceArg::Auto).into(),
-    });
     Ok(CliPlan::Index {
         mode,
         home,
@@ -1706,7 +1782,9 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             graph_indexing: args.graph,
             reset_paths: args.reset_paths,
             scan,
-            embedding,
+            embedding: embeddings.default_model,
+            embedding_routes: embeddings.routes,
+            clear_embedding_routes: embeddings.inherited_kinds,
             allow_remote: args.allow_remote,
             api_key: args.api_key,
             endpoint: args.endpoint.clone(),
@@ -3220,9 +3298,28 @@ mod tests {
     }
 
     #[test]
-    fn index_accepts_one_model_and_rejects_model_routes() {
+    fn duplicate_embedding_assignments_fail_before_indexing() {
+        for assignments in [
+            ["one", "two"],
+            ["code=one", "code=default"],
+            ["image=one", "text=two"],
+        ] {
+            let cli = Cli::try_parse_from([
+                "zg",
+                "--index",
+                "--embedding",
+                assignments[0],
+                "--embedding",
+                assignments[1],
+            ])
+            .expect("parse");
+            assert!(cli.into_plan(PathBuf::from("/workspace")).is_err());
+        }
+    }
+
+    #[test]
+    fn index_configures_a_default_and_per_kind_models() {
         for args in [
-            vec!["zg", "--index", "--embedding", "one", "--embedding", "two"],
             vec!["zg", "--index", "--embedding-route", "text=one"],
             vec!["zg", "--config", "model", "set", "one", "--content", "text"],
         ] {
@@ -3236,6 +3333,10 @@ mod tests {
             "--index",
             "--embedding",
             "local/potion-code-16m-v2",
+            "--embedding",
+            "code=local/jina-embeddings-v2-base-code",
+            "--embedding",
+            "text=default",
             "--device",
             "cpu",
         ])
@@ -3245,6 +3346,11 @@ mod tests {
         else {
             panic!("index");
         };
+        assert_eq!(
+            request.embedding_routes[&super::ContentKind::Code].reference,
+            "local/jina-embeddings-v2-base-code"
+        );
+        assert_eq!(request.clear_embedding_routes, [super::ContentKind::Text]);
         let model = request.embedding.expect("selected model");
         assert_eq!(model.reference, "local/potion-code-16m-v2");
         assert_eq!(model.device, super::Device::Cpu);

@@ -12,10 +12,10 @@ use crate::{
             ContextGroupResult, ContextItem, ContextItemKind, ContextItemStatus,
             ContextQueryGroupMatch, ContextQueryGroupRole, ContextSelectionReason, ContextSource,
             ContextWorkspaceIndex, EmptyReason, IndexDiagnostics, IndexQueryGroupDiagnostics,
-            IndexRouteDiagnostics, MatchedBy,
+            IndexResultGroup, IndexRouteDiagnostics, MatchedBy,
         },
     },
-    domain::{Content, FileRecord, Range, Workspace},
+    domain::{Content, ContentIndex, FileRecord, Range, Workspace},
     utils::sha256_hex,
 };
 
@@ -155,27 +155,90 @@ pub(crate) async fn context_from_index(
     } else {
         request.groups.clone()
     };
-    let limit = context_group_limit(options.limit, groups.len());
-    let mut searches = Vec::with_capacity(groups.len());
-    for group in &groups {
-        searches.push(
-            search_workspace_index(
-                workspace.source_root(),
-                SearchPlan {
-                    routes: group.routes.clone(),
-                    limit: Some(limit),
-                    trace: options.trace,
-                    prefer_symbol: options.prefer_symbol,
-                    filter: options.filter.clone(),
-                },
-                storage,
-                embedding_models,
+    let descriptor = workspace
+        .index()
+        .descriptor()
+        .ok_or_else(|| EngineError::unsupported("workspace indexing is disabled"))?;
+    let targets = super::service::query_targets(descriptor, options)?;
+    let vector = super::service::uses_vectors(request);
+    let pools = ranking_groups(&targets, vector);
+    let per_query = context_group_limit(options.limit, groups.len());
+    let total_limit = options.limit.unwrap_or_else(|| {
+        DEFAULT_CONTEXT_TOTAL_LIMIT.min(DEFAULT_CONTEXT_LIMIT.saturating_mul(groups.len()))
+    });
+    let mut bundles = Vec::with_capacity(pools.len());
+    for group in pools {
+        let runtime = if vector {
+            Some(
+                embedding_models
+                    .iter()
+                    .copied()
+                    .find(|model| model.info().model().reference() == group.models[0])
+                    .ok_or_else(|| {
+                        EngineError::unsupported(format!(
+                            "vector search requires model {}",
+                            group.models[0]
+                        ))
+                    })?,
             )
-            .await?,
-        );
+        } else {
+            None
+        };
+        let mut searches = Vec::with_capacity(groups.len());
+        for query in &groups {
+            searches.push(
+                search_workspace_index(
+                    workspace.source_root(),
+                    SearchPlan {
+                        kinds: group.kinds.clone(),
+                        routes: query.routes.clone(),
+                        limit: Some(per_query),
+                        trace: options.trace,
+                        prefer_symbol: options.prefer_symbol,
+                        filter: options.filter.clone(),
+                    },
+                    storage,
+                    runtime,
+                )
+                .await?,
+            );
+        }
+        bundles.push((group, searches));
     }
+    build_context_result(root, workspace, request, &groups, bundles, total_limit)
+}
 
-    build_context_result(root, workspace, request, &groups, searches)
+/// Both tables embed `Content::Text` with `EmbeddingPurpose::Query`. The workspace
+/// stores one runtime configuration per model reference and rejects conflicting
+/// schemas for that reference, so shared references also share a score space.
+fn ranking_groups(targets: &[ContentIndex], vector: bool) -> Vec<IndexResultGroup> {
+    let mut groups: Vec<IndexResultGroup> = Vec::new();
+    for target in targets {
+        let model = target.embedding.model().reference();
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|g| !vector || g.models.contains(&model))
+        {
+            group.kinds.push(target.kind);
+            if !group.models.contains(&model) {
+                group.models.push(model);
+            }
+        } else {
+            groups.push(IndexResultGroup {
+                kinds: vec![target.kind],
+                models: vec![model],
+                item_start: 0,
+                item_count: 0,
+            });
+        }
+    }
+    groups
+}
+
+struct RankedGroup {
+    metadata: IndexResultGroup,
+    combined: Vec<ContextItem>,
+    per_query: Vec<Vec<ContextItem>>,
 }
 
 fn build_context_result(
@@ -183,38 +246,68 @@ fn build_context_result(
     workspace: &Workspace,
     request: &NormalizedContextRequest,
     groups: &[NormalizedContextGroup],
-    mut searches: Vec<SearchPlanResult>,
+    bundles: Vec<(IndexResultGroup, Vec<SearchPlanResult>)>,
+    total_limit: usize,
 ) -> Result<ContextResult, EngineError> {
-    let group_items = searches
-        .iter()
-        .zip(groups)
-        .map(|(search, group)| search_plan_to_context_items(search, workspace.source_root(), group))
-        .collect::<Result<Vec<_>, _>>()?;
     let coverage_groups = groups
         .iter()
         .filter(|group| group.role == ContextQueryGroupRole::Primary)
         .map(|group| group.id.clone())
         .collect::<Vec<_>>();
-    let items = select_and_rank_context_items(
-        group_items.iter().flatten().cloned().collect(),
-        &coverage_groups,
-    );
-    let timings = searches
+    let mut group_results: Vec<_> = groups
         .iter()
-        .flat_map(|search| search.timings.iter().cloned())
-        .collect();
-    let hits_returned = items.len();
-    let stage_traces = searches
-        .iter_mut()
-        .zip(groups)
-        .filter_map(|(search, group)| {
-            search.stage_trace.take().map(|mut trace| {
-                trace.group_id.clone_from(&group.id);
-                trace
-            })
+        .map(|group| ContextGroupResult {
+            id: group.id.clone(),
+            query: group.query.clone(),
+            role: group.role,
+            result_groups: Vec::new(),
+            items: Vec::new(),
         })
         .collect();
-
+    let mut timings = Vec::new();
+    let mut routes = Vec::new();
+    let mut stage_traces = Vec::new();
+    let mut ranked = Vec::new();
+    for (index, (metadata, searches)) in bundles.into_iter().enumerate() {
+        let mut per_query = Vec::new();
+        for (mut search, query) in searches.into_iter().zip(groups) {
+            per_query.push(search_plan_to_context_items(
+                &search,
+                workspace.source_root(),
+                query,
+            )?);
+            timings.append(&mut search.timings);
+            if let Some(mut trace) = search.stage_trace {
+                trace.group_id.clone_from(&query.id);
+                trace.kinds.clone_from(&metadata.kinds);
+                stage_traces.push(trace);
+            }
+            // Query routes describe the input and are identical across score spaces.
+            if index == 0 {
+                routes.extend(
+                    search
+                        .routes
+                        .into_iter()
+                        .map(|route| IndexRouteDiagnostics {
+                            id: route.id,
+                            mode: route.mode,
+                            query: route.query,
+                        }),
+                );
+            }
+        }
+        let items = select_and_rank_context_items(
+            per_query.iter().flatten().cloned().collect(),
+            &coverage_groups,
+        );
+        ranked.push(RankedGroup {
+            metadata,
+            combined: items,
+            per_query,
+        });
+    }
+    let (items, result_groups) = limit_groups(ranked, total_limit, &mut group_results);
+    let hits_returned = items.len();
     Ok(ContextResult {
         freshness: None,
         background_refresh: None,
@@ -229,20 +322,12 @@ fn build_context_result(
         }),
         items,
         stage_traces,
-        group_results: groups
-            .iter()
-            .zip(group_items)
-            .map(|(group, items)| ContextGroupResult {
-                id: group.id.clone(),
-                query: group.query.clone(),
-                role: group.role,
-                items,
-            })
-            .collect(),
+        group_results,
         diagnostics: ContextDiagnostics {
             empty_reason: (hits_returned == 0).then_some(EmptyReason::NoMatches),
             index: Some(IndexDiagnostics {
                 hits_returned,
+                result_groups,
                 query_groups: groups
                     .iter()
                     .map(|group| IndexQueryGroupDiagnostics {
@@ -251,21 +336,72 @@ fn build_context_result(
                         role: group.role,
                     })
                     .collect(),
-                routes: searches
-                    .into_iter()
-                    .flat_map(|search| search.routes)
-                    .map(|route| IndexRouteDiagnostics {
-                        id: route.id,
-                        mode: route.mode,
-                        query: route.query,
-                    })
-                    .collect(),
+                routes,
             }),
             rg: None,
             structure: None,
             timings,
         },
     })
+}
+
+fn limit_groups(
+    ranked: Vec<RankedGroup>,
+    limit: usize,
+    queries: &mut [ContextGroupResult],
+) -> (Vec<ContextItem>, Vec<IndexResultGroup>) {
+    let counts: Vec<_> = ranked.iter().map(|group| group.combined.len()).collect();
+    let allocations = fair_allocations(&counts, limit);
+    let mut items = Vec::new();
+    let mut result_groups = Vec::new();
+    for (mut group, allocation) in ranked.into_iter().zip(allocations) {
+        group.combined.truncate(allocation);
+        let retained: HashSet<_> = group
+            .combined
+            .iter()
+            .filter_map(|item| item.entity_id.as_deref())
+            .collect();
+        for (query, mut local) in queries.iter_mut().zip(group.per_query) {
+            local.retain(|item| {
+                item.entity_id
+                    .as_deref()
+                    .is_some_and(|id| retained.contains(id))
+            });
+            for (index, item) in local.iter_mut().enumerate() {
+                item.rank = index + 1;
+            }
+            query.result_groups.push(IndexResultGroup {
+                item_start: query.items.len(),
+                item_count: local.len(),
+                ..group.metadata.clone()
+            });
+            query.items.append(&mut local);
+        }
+        group.metadata.item_start = items.len();
+        group.metadata.item_count = group.combined.len();
+        result_groups.push(group.metadata);
+        items.append(&mut group.combined);
+    }
+    (items, result_groups)
+}
+
+/// Distribute one total limit in stable table order, lending unused slots to
+/// groups with more candidates. Scores from different models never meet.
+fn fair_allocations(counts: &[usize], mut remaining: usize) -> Vec<usize> {
+    let mut allocations = vec![0; counts.len()];
+    while remaining > 0 {
+        let before = remaining;
+        for (&available, allocated) in counts.iter().zip(&mut allocations) {
+            if remaining > 0 && *allocated < available {
+                *allocated += 1;
+                remaining -= 1;
+            }
+        }
+        if remaining == before {
+            break;
+        }
+    }
+    allocations
 }
 
 fn context_group_limit(limit: Option<usize>, group_count: usize) -> usize {
@@ -640,7 +776,14 @@ mod tests {
         },
     };
 
-    use super::{normalize_context_request, select_and_rank_context_items};
+    use super::{fair_allocations, normalize_context_request, select_and_rank_context_items};
+
+    #[test]
+    fn lends_unused_slots_in_stable_group_order() {
+        assert_eq!(fair_allocations(&[0, 3, 8], 8), [0, 3, 5]);
+        assert_eq!(fair_allocations(&[5, 5], 3), [2, 1]);
+        assert_eq!(fair_allocations(&[0, 1], 10), [0, 1]);
+    }
 
     #[test]
     fn best_fragment_preserves_evidence_and_returns_the_complete_entity() {
@@ -942,7 +1085,16 @@ mod tests {
                 &workspace,
                 &request,
                 &request.groups,
-                vec![search.clone()],
+                vec![(
+                    super::IndexResultGroup {
+                        kinds: vec![crate::domain::ContentKind::Text],
+                        models: vec!["local/model".to_owned()],
+                        item_start: 0,
+                        item_count: 0,
+                    },
+                    vec![search.clone()],
+                )],
+                10,
             )
             .expect("context result");
             assert_eq!(result.root, requested_root);

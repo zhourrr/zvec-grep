@@ -19,8 +19,8 @@ use crate::{
         stage_trace::StageTrace,
     },
     domain::{
-        Content, Entity, EntityFragment, EntityId, FileId, FileRecord,
-        model::{EmbeddingModelInfo, EmbeddingPurpose},
+        Content, ContentKind, Entity, EntityFragment, EntityId, FileId, FileRecord,
+        model::{EmbeddingMetric, EmbeddingModelInfo, EmbeddingPurpose},
     },
     models::{EmbeddingOptions, ModelError, ModelRuntimeLease},
     storage::types::{StoragePathFilter, StorageSearchFilter, StorageSearchHit, StoredSearchData},
@@ -42,6 +42,7 @@ const RECALL_MIN_TARGET_CANDIDATES: usize = 50;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchPlan {
+    pub kinds: Vec<ContentKind>,
     pub routes: Vec<SearchRoute>,
     pub limit: Option<usize>,
     pub trace: bool,
@@ -146,7 +147,7 @@ impl SearchEmbeddingRuntime for RequestEmbeddingRuntime<'_> {
 struct RecallRoute {
     route: ResolvedSearchRoute,
     filter: Option<StorageSearchFilter>,
-    vector_route_id: Option<String>,
+    code_only: bool,
 }
 
 struct Candidate {
@@ -170,13 +171,13 @@ pub(crate) async fn search_workspace_index(
     workspace_root: &Path,
     plan: SearchPlan,
     storage: &dyn SearchStorage,
-    embedding_models: &[&dyn SearchEmbeddingRuntime],
+    model: Option<&dyn SearchEmbeddingRuntime>,
 ) -> Result<SearchPlanResult, EngineError> {
     search_with_stage_trace(
         workspace_root,
         plan,
         storage,
-        embedding_models,
+        model,
         configured_paths().as_ref(),
     )
     .await
@@ -186,14 +187,9 @@ async fn search_with_stage_trace(
     workspace_root: &Path,
     plan: SearchPlan,
     storage: &dyn SearchStorage,
-    embedding_models: &[&dyn SearchEmbeddingRuntime],
+    model: Option<&dyn SearchEmbeddingRuntime>,
     watched: Option<&HashSet<PathBuf>>,
 ) -> Result<SearchPlanResult, EngineError> {
-    if embedding_models.len() > 1 {
-        return Err(EngineError::unsupported(
-            "this version supports only one embedding model per workspace",
-        ));
-    }
     let total_started = Instant::now();
     let plan_started = Instant::now();
     let routes = resolve_routes(&plan.routes)?;
@@ -212,10 +208,10 @@ async fn search_with_stage_trace(
             .iter()
             .any(|route| route.mode == SearchRouteMode::Vector)
     {
-        let model = embedding_models.first().ok_or_else(|| {
+        let model = model.ok_or_else(|| {
             EngineError::unsupported("vector search requires a configured embedding model")
         })?;
-        embed_vector_routes(&routes, *model).await?
+        embed_vector_routes(&routes, model).await?
     } else {
         HashMap::new()
     };
@@ -223,13 +219,15 @@ async fn search_with_stage_trace(
 
     let mut observation =
         watched.map(|paths| StageTraceCollector::begin(&routes, limit, paths, storage));
+    let prefer_symbol = plan.prefer_symbol && plan.kinds.contains(&ContentKind::Code);
     let recall_started = Instant::now();
     let mut candidates = HashMap::new();
     if has_searchable_files && limit > 0 {
         collect_adaptive_recall(
             &routes,
             filter.as_ref(),
-            plan.prefer_symbol,
+            prefer_symbol,
+            &plan.kinds,
             &vectors,
             limit,
             storage,
@@ -263,7 +261,7 @@ async fn search_with_stage_trace(
         observation.loaded(&hits);
     }
     let ranking_started = Instant::now();
-    let maximum_rrf = build_recall_routes(&routes, filter.as_ref(), plan.prefer_symbol)
+    let maximum_rrf = build_recall_routes(&routes, filter.as_ref(), prefer_symbol)
         .iter()
         .map(|_| 1.0 / (RRF_K + 1.0))
         .sum();
@@ -346,7 +344,7 @@ fn validate_modified_range(plan: &SearchPlan) -> Result<(), EngineError> {
 }
 
 struct ModelQueryVector {
-    model: String,
+    metric: EmbeddingMetric,
     values: Vec<f32>,
 }
 
@@ -378,7 +376,7 @@ async fn embed_vector_routes(
             vectors.insert(
                 route.id.clone(),
                 ModelQueryVector {
-                    model: model.info().model().reference(),
+                    metric: model.info().metric(),
                     values: vector,
                 },
             );
@@ -392,6 +390,7 @@ fn collect_adaptive_recall(
     routes: &[ResolvedSearchRoute],
     filter: Option<&StorageSearchFilter>,
     prefer_symbol: bool,
+    kinds: &[ContentKind],
     vectors: &HashMap<String, ModelQueryVector>,
     limit: usize,
     storage: &dyn SearchStorage,
@@ -399,29 +398,20 @@ fn collect_adaptive_recall(
     mut observation: Option<&mut StageTraceCollector>,
 ) -> Result<(), EngineError> {
     let recall_routes = build_recall_routes(routes, filter, prefer_symbol);
-    let target = (limit * RECALL_TARGET_FACTOR).max(RECALL_MIN_TARGET_CANDIDATES);
+    let target = limit
+        .saturating_mul(RECALL_TARGET_FACTOR)
+        .max(RECALL_MIN_TARGET_CANDIDATES);
     let mut depth = RECALL_INITIAL_DEPTH;
     loop {
         let mut saturated = false;
         for route in &recall_routes {
-            let hits = match route.route.mode {
-                SearchRouteMode::Fts => {
-                    storage.search_fts(&route.route.query, depth, route.filter.as_ref())?
-                }
-                SearchRouteMode::Vector => vectors
-                    .get(route.vector_route_id.as_deref().unwrap_or(&route.route.id))
-                    .map_or_else(
-                        || Ok(Vec::new()),
-                        |vector| {
-                            storage.search_vector(
-                                &vector.model,
-                                &vector.values,
-                                depth,
-                                route.filter.as_ref(),
-                            )
-                        },
-                    )?,
+            let vector = vectors.get(&route.route.id);
+            let target_kinds = if route.code_only {
+                &[ContentKind::Code][..]
+            } else {
+                kinds
             };
+            let hits = recall_kinds(storage, target_kinds, route, vector, depth)?;
             saturated |= hits.len() >= depth;
             if let Some(observation) = observation.as_deref_mut() {
                 observation.recall(&route.route.id, depth, &hits);
@@ -435,6 +425,46 @@ fn collect_adaptive_recall(
     }
 }
 
+/// Pool the same logical route across its physical tables before entity fusion,
+/// structural reranking and the result cutoff. Preserve native single-table order.
+fn recall_kinds(
+    storage: &dyn SearchStorage,
+    kinds: &[ContentKind],
+    route: &RecallRoute,
+    vector: Option<&ModelQueryVector>,
+    depth: usize,
+) -> Result<Vec<StorageSearchHit>, EngineError> {
+    let mut pooled = Vec::new();
+    for &kind in kinds {
+        let hits = match route.route.mode {
+            SearchRouteMode::Fts => {
+                storage.search_fts(kind, &route.route.query, depth, route.filter.as_ref())?
+            }
+            SearchRouteMode::Vector => {
+                let query = vector
+                    .ok_or_else(|| EngineError::internal("missing vector for recall route"))?;
+                storage.search_vector(kind, &query.values, depth, route.filter.as_ref())?
+            }
+        };
+        if kinds.len() == 1 {
+            return Ok(hits);
+        }
+        pooled.extend(hits.into_iter().enumerate());
+    }
+    pooled.sort_by(|(left_rank, left), (right_rank, right)| {
+        let order = match vector.map(|query| query.metric) {
+            // BM25 uses corpus statistics specific to each kind table.
+            None => left_rank.cmp(right_rank),
+            Some(EmbeddingMetric::DotProduct) => right.score.total_cmp(&left.score),
+            Some(EmbeddingMetric::Cosine | EmbeddingMetric::Euclidean) => {
+                left.score.total_cmp(&right.score)
+            }
+        };
+        order.then_with(|| left.document_id.cmp(&right.document_id))
+    });
+    Ok(pooled.into_iter().take(depth).map(|(_, hit)| hit).collect())
+}
+
 fn build_recall_routes(
     routes: &[ResolvedSearchRoute],
     filter: Option<&StorageSearchFilter>,
@@ -444,23 +474,13 @@ fn build_recall_routes(
         .iter()
         .cloned()
         .map(|route| RecallRoute {
-            vector_route_id: (route.mode == SearchRouteMode::Vector).then(|| route.id.clone()),
+            code_only: false,
             route,
             filter: filter.cloned(),
         })
         .collect::<Vec<_>>();
     if prefer_symbol {
-        let mut symbol_routes = HashSet::new();
         for route in routes {
-            // Model expansion creates independent vector searches, while symbol
-            // recall still searches all FTS partitions for the original route.
-            let logical_id = route
-                .id
-                .split_once('@')
-                .map_or(route.id.as_str(), |(id, _)| id);
-            if !symbol_routes.insert(logical_id) {
-                continue;
-            }
             let symbol_names = extract_symbol_names(&route.query);
             if symbol_names.is_empty() {
                 continue;
@@ -469,12 +489,12 @@ fn build_recall_routes(
             symbol_filter.symbol_names = Some(symbol_names);
             output.push(RecallRoute {
                 route: ResolvedSearchRoute {
-                    id: format!("{logical_id}.prefer-symbol"),
+                    id: format!("{}.prefer-symbol", route.id),
                     mode: SearchRouteMode::Fts,
                     query: route.query.clone(),
                 },
                 filter: Some(symbol_filter),
-                vector_route_id: None,
+                code_only: true,
             });
         }
     }
@@ -901,8 +921,9 @@ mod tests {
     use crate::{
         EngineResult,
         domain::{
-            ByteRange, Content, Entity, EntityFragment, EntityId, FileCategory, FileFormat, FileId,
-            FileIndexStatus, FileRecord, FileSnapshot, FragmentId, GlobRule, Range, TextRange,
+            ByteRange, Content, ContentKind, Entity, EntityFragment, EntityId, FileCategory,
+            FileFormat, FileId, FileIndexStatus, FileRecord, FileSnapshot, FragmentId, GlobRule,
+            Range, TextRange,
             model::{EmbeddingMetric, EmbeddingModelInfo},
         },
         file_selection::GlobMatcher,
@@ -961,7 +982,10 @@ mod tests {
                 .lock()
                 .expect("query call mutex")
                 .push(queries.to_vec());
-            Ok(queries.iter().map(|_| vec![0.25, 0.75]).collect())
+            Ok(queries
+                .iter()
+                .map(|_| vec![0.25; self.info.dimension()])
+                .collect())
         }
     }
 
@@ -978,6 +1002,7 @@ mod tests {
     }
 
     struct FixtureHit {
+        kind: ContentKind,
         hit: StorageSearchHit,
         fragment: EntityFragment,
     }
@@ -986,6 +1011,7 @@ mod tests {
         fn hits_with_filter(
             &self,
             hits: &[FixtureHit],
+            kind: ContentKind,
             limit: usize,
             filter: Option<&StorageSearchFilter>,
         ) -> Vec<StorageSearchHit> {
@@ -994,6 +1020,7 @@ mod tests {
                 .expect("filter mutex")
                 .push(filter.cloned());
             hits.iter()
+                .filter(|hit| hit.kind == kind)
                 .filter(|hit| {
                     filter
                         .and_then(|filter| filter.file_ids.as_ref())
@@ -1124,12 +1151,14 @@ mod tests {
 
         fn search_fts(
             &self,
+            kind: ContentKind,
             query: &str,
             limit: usize,
             filter: Option<&StorageSearchFilter>,
         ) -> EngineResult<Vec<StorageSearchHit>> {
             Ok(self.hits_with_filter(
                 self.fts.get(query).map_or(&[], Vec::as_slice),
+                kind,
                 limit,
                 filter,
             ))
@@ -1137,17 +1166,211 @@ mod tests {
 
         fn search_vector(
             &self,
-            _model: &str,
+            kind: ContentKind,
             _vector: &[f32],
             limit: usize,
             filter: Option<&StorageSearchFilter>,
         ) -> EngineResult<Vec<StorageSearchHit>> {
-            let mut hits = self.hits_with_filter(&self.vector, limit, filter);
+            let mut hits = self.hits_with_filter(&self.vector, kind, limit, filter);
             if self.reorder_deeper_vector_results && limit > super::RECALL_INITIAL_DEPTH {
                 hits.reverse();
             }
             Ok(hits)
         }
+    }
+
+    fn routed_workspace(
+        root: &Path,
+        default: &FixtureModel,
+        code: Option<&FixtureModel>,
+    ) -> crate::domain::Workspace {
+        use crate::domain::{
+            FTS_CONFIG, IndexDescriptor, IndexState, ScanRules, Workspace, WorkspaceLayout,
+        };
+        let routes = code
+            .map(|model| (ContentKind::Code, model.info.clone()))
+            .into_iter()
+            .collect();
+        let descriptor = IndexDescriptor::new(
+            default.info.clone(),
+            routes,
+            std::collections::BTreeMap::new(),
+            false,
+            FTS_CONFIG,
+        )
+        .expect("routes");
+        Workspace::new(
+            root,
+            WorkspaceLayout::new(root.join(".zvec-grep")).expect("layout"),
+            ScanRules::default(),
+            crate::workspace::CURRENT_INDEX_VERSION,
+            Some(uuid::Uuid::new_v4().to_string()),
+            0,
+            0,
+            IndexState::Enabled(Box::new(descriptor)),
+        )
+        .expect("workspace")
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unavailable_explicit_table_before_refresh_or_model_acquisition() {
+        use crate::api::context::ContextOptions;
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut model = FixtureModel::new();
+        let mut metadata = serde_json::to_value(&model.info).expect("fixture metadata");
+        metadata["model"]["contentKinds"] = serde_json::json!(["text"]);
+        model.info = serde_json::from_value(metadata).expect("text-only table");
+        let workspace = routed_workspace(dir.path(), &model, None);
+        let path = workspace.layout().manifest_path();
+        crate::workspace::manifest::write_workspace_manifest(path, &workspace)
+            .expect("write manifest");
+        let before = std::fs::read(path).expect("manifest");
+        let options = ContextOptions {
+            query: Some("hello".into()),
+            root: Some(dir.path().to_owned()),
+            target_kinds: vec![ContentKind::Code],
+            ..ContextOptions::default()
+        };
+        let error = options
+            .validate_index_targets()
+            .expect_err("preflight detects absent table");
+        assert!(
+            error
+                .message()
+                .contains("code content table is not enabled")
+        );
+        let direct = crate::ZvecGrep::new()
+            .context(options)
+            .await
+            .expect_err("direct search rejects it");
+        assert_eq!(direct.code(), error.code());
+        assert_eq!(std::fs::read(path).expect("unchanged manifest"), before);
+        assert!(!workspace.layout().index_dir().exists());
+    }
+
+    fn kind_storage() -> FixtureStorage {
+        let text = fixture_entity(&file(1, "guide.txt", 1), Content::Text("one".into()));
+        let code = entity(&file(2, "main.rs", 1), "two");
+        let mut storage = pushdown_storage();
+        storage.files = vec![text.file.clone(), code.file.clone()];
+        storage.vector = vec![
+            hit(&text, 0, StorageSearchPath::Vector, 0.8),
+            hit(&code, 0, StorageSearchPath::Vector, 0.1),
+        ];
+        storage.fts.insert(
+            "colors".into(),
+            vec![
+                hit(&text, 0, StorageSearchPath::Fts, 1.0),
+                hit(&code, 0, StorageSearchPath::Fts, 10.0),
+            ],
+        );
+        storage.entities = [text, code]
+            .into_iter()
+            .map(|entity| (entity.entity.id().as_str().to_owned(), entity))
+            .collect();
+        storage
+    }
+
+    #[tokio::test]
+    async fn search_pools_compatible_tables_before_cutoff_and_separates_model_spaces() {
+        use crate::{
+            api::context::ContextOptions,
+            domain::Workspace,
+            pipelines::indexed_search::context::{context_from_index, normalize_context_request},
+        };
+        let dir = tempfile::tempdir().expect("workspace root");
+        let root = dir.path();
+        let storage = kind_storage();
+        let shared = FixtureModel::new();
+        let mut alternative = FixtureModel::new();
+        let mut metadata = serde_json::to_value(&alternative.info).expect("fixture metadata");
+        metadata["model"]["name"] = "other".into();
+        metadata["dimension"] = 3.into();
+        alternative.info = serde_json::from_value(metadata).expect("second vector space");
+        let options = ContextOptions {
+            routes: vec![SearchRoute {
+                mode: SearchRouteMode::Vector,
+                query: "colors".into(),
+            }],
+            limit: Some(1),
+            trace: true,
+            ..ContextOptions::default()
+        };
+        let search = async |workspace: &Workspace,
+                            options: &ContextOptions,
+                            models: &[&dyn SearchEmbeddingRuntime]| {
+            let request = normalize_context_request(options).expect("valid input");
+            context_from_index(root, workspace, &storage, models, options, &request)
+                .await
+                .expect("search")
+        };
+        let mixed = routed_workspace(root, &shared, None);
+        let result = search(&mixed, &options, &[&shared]).await;
+        assert_eq!(
+            result.items[0].relative_path,
+            Path::new("main.rs"),
+            "smaller cosine distance wins the shared pool"
+        );
+        assert_eq!(shared.calls.lock().expect("calls").len(), 1);
+        let groups = result.diagnostics.index.expect("index").result_groups;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kinds, vec![ContentKind::Text, ContentKind::Code]);
+
+        let separate = routed_workspace(root, &shared, Some(&alternative));
+        let models: &[&dyn SearchEmbeddingRuntime] = &[&shared, &alternative];
+        let result = search(&separate, &options, models).await;
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].relative_path, Path::new("guide.txt"));
+        let groups = result.diagnostics.index.expect("index").result_groups;
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| (g.item_start, g.item_count))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 0)]
+        );
+        assert_eq!(result.group_results[0].result_groups, groups);
+        assert_eq!(alternative.calls.lock().expect("calls").len(), 1);
+
+        let mut other = FixtureModel::new();
+        let mut metadata = serde_json::to_value(&other.info).expect("fixture metadata");
+        metadata["model"]["name"] = "other".into();
+        other.info = serde_json::from_value(metadata).expect("same dimension but distinct model");
+        let same_dimension = routed_workspace(root, &shared, Some(&other));
+        let result = search(&same_dimension, &options, &[&shared, &other]).await;
+        assert_eq!(
+            result.diagnostics.index.expect("index").result_groups.len(),
+            2
+        );
+
+        let targeted = ContextOptions {
+            target_kinds: vec![ContentKind::Code],
+            ..options.clone()
+        };
+        let result = search(&separate, &targeted, &[&alternative]).await;
+        assert_eq!(result.items[0].relative_path, Path::new("main.rs"));
+        assert_eq!(
+            result.diagnostics.index.expect("index").result_groups[0].kinds,
+            vec![ContentKind::Code]
+        );
+
+        let lexical = ContextOptions {
+            routes: vec![SearchRoute {
+                mode: SearchRouteMode::Fts,
+                query: "colors".into(),
+            }],
+            limit: Some(2),
+            ..options
+        };
+        let result = search(&separate, &lexical, &[]).await;
+        let groups = result.diagnostics.index.expect("index").result_groups;
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(
+            groups.len(),
+            1,
+            "FTS pools rows independently of the vector model"
+        );
+        assert_eq!(groups[0].models.len(), 2);
     }
 
     #[tokio::test]
@@ -1212,7 +1435,7 @@ mod tests {
         }]);
         request.limit = Some(1);
         let root = tempfile::tempdir().expect("workspace");
-        let result = search_workspace_index(root.path(), request, &storage, &[])
+        let result = search_workspace_index(root.path(), request, &storage, None)
             .await
             .expect("search");
         assert_eq!(result.hits[0].entity.id(), &definition_id);
@@ -1256,7 +1479,7 @@ mod tests {
                 },
             ]),
             &storage,
-            &[&model],
+            Some(&model),
         )
         .await
         .expect("hybrid search");
@@ -1337,7 +1560,7 @@ mod tests {
                     Path::new("/workspace"),
                     request.clone(),
                     &storage,
-                    &[&model],
+                    Some(&model),
                     None,
                 )
                 .await
@@ -1346,7 +1569,7 @@ mod tests {
                     Path::new("/workspace"),
                     request,
                     &storage,
-                    &[&model],
+                    Some(&model),
                     Some(&watched),
                 )
                 .await
@@ -1476,7 +1699,7 @@ mod tests {
             Path::new("/workspace"),
             plan,
             &storage,
-            &[&FixtureModel::new()],
+            Some(&FixtureModel::new()),
         )
         .await
         .expect("search");
@@ -1544,7 +1767,8 @@ mod tests {
                 mode: SearchRouteMode::Fts,
                 query: "query".to_owned(),
             }]);
-            let result = search_workspace_index(Path::new("/workspace"), plan, &storage, &[]).await;
+            let result =
+                search_workspace_index(Path::new("/workspace"), plan, &storage, None).await;
             if missing {
                 assert!(result.expect("interrupted replacement").hits.is_empty());
             } else {
@@ -1603,45 +1827,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_models_are_rejected_before_query_embedding() {
-        let source = file(1, "src/service.rs", 200);
-        let owner = entity(&source, "Service implementation");
-        let storage = FixtureStorage {
-            paths_only: false,
-            forbid_enumeration: false,
-            files: vec![source],
-            entities: HashMap::from([(owner.entity.id().as_str().to_owned(), owner.clone())]),
-            fts: HashMap::from([(
-                "Service".to_owned(),
-                vec![hit(&owner, 0, StorageSearchPath::Fts, 2.0)],
-            )]),
-            vector: Vec::new(),
-            reorder_deeper_vector_results: false,
-            filters: Arc::new(Mutex::new(Vec::new())),
-            load_batches: Mutex::default(),
-        };
-        let first = FixtureModel::new();
-        let mut second = FixtureModel::new();
-        {
-            let mut metadata = serde_json::to_value(&second.info).expect("model metadata");
-            metadata["model"]["name"] = serde_json::json!("second");
-            second.info = serde_json::from_value(metadata).expect("valid model metadata");
-        }
-        let mut query = plan(vec![SearchRoute {
-            mode: SearchRouteMode::Vector,
-            query: "Service".to_owned(),
-        }]);
-        query.prefer_symbol = true;
-        let error =
-            search_workspace_index(Path::new("/workspace"), query, &storage, &[&first, &second])
-                .await
-                .expect_err("multiple models are unsupported");
-        assert!(error.message().contains("only one embedding model"));
-        assert!(first.calls.lock().expect("first model calls").is_empty());
-        assert!(second.calls.lock().expect("second model calls").is_empty());
-    }
-
-    #[tokio::test]
     async fn pushes_file_and_symbol_filters_into_storage() {
         let source = file(1, "src/service.rs", 200);
         let docs = file(2, "docs/service.md", 200);
@@ -1682,7 +1867,7 @@ mod tests {
         plan.filter.included_formats = vec![FileFormat::Rust];
         plan.prefer_symbol = true;
 
-        let result = search_workspace_index(Path::new("/workspace"), plan, &storage, &[])
+        let result = search_workspace_index(Path::new("/workspace"), plan, &storage, None)
             .await
             .expect("filtered search");
 
@@ -2444,6 +2629,7 @@ mod tests {
 
     fn plan(routes: Vec<SearchRoute>) -> SearchPlan {
         SearchPlan {
+            kinds: vec![ContentKind::Code],
             routes,
             limit: Some(10),
             trace: true,
@@ -2470,11 +2656,16 @@ mod tests {
     }
 
     fn entity(file: &FileRecord, content: &str) -> StoredEntity {
-        let source_range = Range::Text(
-            TextRange::from_coordinates(0, content.len(), 1, 1, 0, content.len())
-                .expect("source range"),
-        );
-        let content = Content::Text(content.to_owned());
+        fixture_entity(file, Content::Code(content.to_owned()))
+    }
+
+    fn fixture_entity(file: &FileRecord, content: Content) -> StoredEntity {
+        let len = match &content {
+            Content::Text(text) | Content::Code(text) => text.len(),
+            Content::Image(_) => unreachable!("fixture requires textual content"),
+        };
+        let source_range =
+            Range::Text(TextRange::from_coordinates(0, len, 1, 1, 0, len).expect("source range"));
         let id = EntityId::new(file.id(), &content, source_range).expect("entity id");
         let fragment = EntityFragment {
             id: FragmentId::new(&id, 0),
@@ -2490,6 +2681,7 @@ mod tests {
     fn hit(stored: &StoredEntity, ordinal: u32, path: StorageSearchPath, score: f64) -> FixtureHit {
         let fragment_id = FragmentId::new(stored.entity.id(), ordinal);
         FixtureHit {
+            kind: stored.entity.content().kind(),
             hit: StorageSearchHit {
                 document_id: fragment_id.as_str().to_owned(),
                 entity_id: stored.entity.id().clone(),
