@@ -11,7 +11,9 @@ mod source_map;
 mod spi;
 mod text;
 
+pub(crate) use chunking::limit_entity_fragments;
 pub(crate) use code::code_outline;
+pub(crate) use service::is_code_source;
 
 // Extraction sources.
 pub(crate) use spi::{ImageSource, Source, SourceKind, TextSource};
