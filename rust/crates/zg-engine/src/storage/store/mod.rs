@@ -907,7 +907,7 @@ fn load_schema(
             ensure_compatible(&schema, indexes)?;
         }
         for collection in collection_names(&schema) {
-            let collection_path = path.join(&collection);
+            let collection_path = path.join(collection);
             if !directory_exists(&collection_path)? {
                 return Err(EngineError::storage_failure(format!(
                     "index collection {collection} is missing; rebuild the index"
@@ -944,18 +944,10 @@ fn load_schema(
     Ok((indexes, true))
 }
 
-fn collection_names(schema: &[ContentIndex]) -> impl Iterator<Item = String> + '_ {
-    [
-        "files".to_owned(),
-        "directories".to_owned(),
-        "entities".to_owned(),
-    ]
-    .into_iter()
-    .chain(
-        schema
-            .iter()
-            .map(|index| fragments::fragment_collection_name(index.kind)),
-    )
+fn collection_names(schema: &[ContentIndex]) -> impl Iterator<Item = &'static str> + '_ {
+    ["files", "directories", "entities"]
+        .into_iter()
+        .chain(schema.iter().map(|index| index.kind.as_str()))
 }
 
 fn registry() -> EngineResult<MutexGuard<'static, HashMap<PathBuf, Weak<SharedStore>>>> {

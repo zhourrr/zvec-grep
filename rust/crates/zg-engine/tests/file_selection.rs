@@ -799,9 +799,7 @@ async fn catalog_name_predicates_filter_both_native_search_routes() -> TestResul
         [ContentKind::Text, ContentKind::Code]
     );
     for collection in collections {
-        let collection_path = info
-            .index_path
-            .join(format!("fragments_{}", collection.kind.as_str()));
+        let collection_path = info.index_path.join(collection.kind.as_str());
         assert_native_exclusion_error(
             &engine,
             root,

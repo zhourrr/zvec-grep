@@ -60,9 +60,8 @@ impl Fragments {
                 EmbeddingMetric::DotProduct => MetricType::Ip,
                 EmbeddingMetric::Euclidean => MetricType::L2,
             };
-            let name = fragment_collection_name(route.kind);
             let collection = open_collection(
-                &root.join(&name),
+                &root.join(route.kind.as_str()),
                 &fragments_schema(dimension, metric)?,
                 read_only,
             )?;
@@ -306,10 +305,6 @@ impl Fragments {
 
 fn primary_key(namespace: &str, value: &str) -> String {
     sha256_hex_parts([namespace.as_bytes(), b"\0", value.as_bytes()])
-}
-
-pub(super) fn fragment_collection_name(kind: ContentKind) -> String {
-    format!("fragments_{}", kind.as_str())
 }
 
 fn identity_schema(name: &str) -> EngineResult<CollectionSchema> {

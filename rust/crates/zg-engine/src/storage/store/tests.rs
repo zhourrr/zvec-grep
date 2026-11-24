@@ -599,7 +599,7 @@ fn initializes_schema_only_in_empty_storage() {
 
 #[test]
 fn rejects_existing_collections_without_schema_before_opening_them() {
-    for collection in ["files", "directories", "entities", "fragments_existing"] {
+    for collection in ["files", "directories", "entities", "text", "code"] {
         let directory = tempfile::tempdir().expect("fixture directory");
         let path = directory.path();
         let collection_path = path.join(collection);
@@ -1600,8 +1600,8 @@ fn kind_tables_partition_fragments_and_failed_files_clear_every_partition() {
         "directories".to_owned(),
         "files".to_owned(),
         "entities".to_owned(),
-        "fragments_text".to_owned(),
-        "fragments_image".to_owned(),
+        "text".to_owned(),
+        "image".to_owned(),
     ];
     expected.sort();
     assert_eq!(
@@ -1716,7 +1716,7 @@ fn duplicate_kinds_are_rejected_before_opening_storage() {
     .expect("stored collection names also require validation");
     assert_eq!(error.code(), EngineError::STORAGE_FAILURE);
     assert!(error.message().contains("duplicate content index for text"));
-    assert!(!home.path().join("fragments_text").exists());
+    assert!(!home.path().join("text").exists());
 }
 
 #[test]

@@ -486,16 +486,8 @@ async fn text_and_code_share_one_model_and_support_incremental_search() -> TestR
     assert_eq!(tables[0]["kind"], "text");
     assert_eq!(tables[1]["kind"], "code");
     assert_eq!(tables[0]["embedding"], tables[1]["embedding"]);
-    assert_eq!(
-        fs::read_dir(&info.index_path)?
-            .filter_map(Result::ok)
-            .filter(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("fragments_"))
-            .count(),
-        2,
-    );
+    assert!(info.index_path.join("text").is_dir());
+    assert!(info.index_path.join("code").is_dir());
     assert_eq!(
         fts_paths(&engine, root, "orchardguide").await?,
         [PathBuf::from("code.rs")]
@@ -674,13 +666,8 @@ async fn one_text_model_indexes_text_and_skips_images_without_embedding_them() -
             .index_version,
         Some(3)
     );
-    let collections = fragment_collections(&info.index_path)?;
-    assert_eq!(collections.len(), 2);
     assert_vector_indexes_complete(&info.index_path)?;
-    assert_eq!(
-        native_documents(&info.index_path.join("fragments_text"))?.len(),
-        1
-    );
+    assert_eq!(native_documents(&info.index_path.join("text"))?.len(), 1);
     assert_eq!(
         native_documents(&info.index_path.join("entities"))?.len(),
         1
@@ -927,9 +914,8 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
     }
     assert!(coverage.into_iter().all(|covered| covered));
     assert_eq!(server.inputs.load(Ordering::Acquire), fragments.len());
-    let collections = fragment_collections(&info.index_path)?;
-    assert_eq!(collections.len(), 2);
-    let projected = native_documents(&info.index_path.join("fragments_code"))?;
+    assert!(native_documents(&info.index_path.join("text"))?.is_empty());
+    let projected = native_documents(&info.index_path.join("code"))?;
     assert_eq!(projected.len(), fragments.len());
     let mut projected_ids = BTreeSet::new();
     for doc in projected {
@@ -2025,32 +2011,19 @@ async fn fts_paths(
 
 fn assert_single_text_projection(index_path: &Path, filename: &str) -> TestResult {
     let entities = native_documents(&index_path.join("entities"))?;
-    let text = native_documents(&index_path.join("fragments_text"))?;
+    let text = native_documents(&index_path.join("text"))?;
     assert_eq!(entities.len(), 1);
     assert_eq!(text.len(), 1);
     assert_eq!(text[0].get_string("file_name")?.as_deref(), Some(filename));
     let owner = text[0].get_string("entity_id")?.expect("fragment owner");
     assert_eq!(entities[0].get_pk(), Some(owner.as_str()));
-    assert!(native_documents(&index_path.join("fragments_code"))?.is_empty());
+    assert!(native_documents(&index_path.join("code"))?.is_empty());
     Ok(())
 }
 
-fn fragment_collections(index_path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    Ok(fs::read_dir(index_path)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("fragments_"))
-        })
-        .map(|entry| entry.path())
-        .collect())
-}
-
 fn assert_vector_indexes_complete(index_path: &Path) -> TestResult {
-    for path in fragment_collections(index_path)? {
+    for kind in ["text", "code"] {
+        let path = index_path.join(kind);
         #[cfg(windows)]
         let path = dunce::simplified(&path);
         let mut options = zvec_rust::CollectionOptions::new()?;
