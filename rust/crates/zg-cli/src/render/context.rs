@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use zg_engine::api::context::{
     ContextResult,
+    options::ContentKind,
     result::{
         ContentRange, ContextCoverage, ContextItem, ContextItemKind, ContextItemStatus,
         EmptyReason, EntityMetadata, IndexResultGroup,
@@ -30,8 +31,9 @@ pub(super) fn write(
     terminal: bool,
 ) -> io::Result<()> {
     let theme = StatusTheme::new(options.color, terminal);
+    let heading_theme = terminal.then_some(theme);
     if options.preview == PreviewMode::Detail {
-        return write_detail(writer, result, options, theme);
+        return write_detail(writer, result, options, theme, heading_theme);
     }
     if result.group_results.is_empty() {
         if result.items.is_empty()
@@ -44,9 +46,13 @@ pub(super) fn write(
             .index
             .as_ref()
             .map_or(&[][..], |index| index.result_groups.as_slice());
-        return write_rank_groups(writer, &result.items, groups, |writer, items| {
-            write_items(writer, items, &result.query, options, theme)
-        });
+        return write_rank_groups(
+            writer,
+            &result.items,
+            groups,
+            heading_theme,
+            |writer, items| write_items(writer, items, &result.query, options, theme),
+        );
     }
     let groups = result
         .group_results
@@ -78,6 +84,7 @@ pub(super) fn write(
             writer,
             &group.items,
             &group.result_groups,
+            heading_theme,
             |writer, items| write_items(writer, items, &group.query, options, theme),
         )?;
     }
@@ -89,6 +96,7 @@ fn write_rank_groups<W: Write>(
     writer: &mut W,
     items: &[ContextItem],
     groups: &[IndexResultGroup],
+    heading_theme: Option<StatusTheme>,
     mut render: impl FnMut(&mut W, &[ContextItem]) -> io::Result<()>,
 ) -> io::Result<()> {
     if groups.iter().filter(|group| group.item_count > 0).count() <= 1 {
@@ -106,16 +114,30 @@ fn write_rank_groups<W: Write>(
                 "search result group exceeds the returned hits",
             )
         })?;
-        if index > 0 {
+        if index > 0 || heading_theme.is_some() {
             writeln!(writer)?;
         }
-        let kinds = group
-            .kinds
-            .iter()
-            .map(|kind| kind.as_str())
-            .collect::<Vec<_>>()
-            .join(" + ");
-        writeln!(writer, "{kinds} results")?;
+        if let Some(theme) = heading_theme {
+            let title = group
+                .kinds
+                .iter()
+                .map(|kind| match kind {
+                    ContentKind::Text => "Text",
+                    ContentKind::Code => "Code",
+                    ContentKind::Image => "Image",
+                })
+                .collect::<Vec<_>>()
+                .join(" + ");
+            writeln!(writer, "{}", theme.group_heading(&title))?;
+        } else {
+            let kinds = group
+                .kinds
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ");
+            writeln!(writer, "{kinds} results")?;
+        }
         render(writer, slice)?;
     }
     Ok(())
@@ -276,6 +298,7 @@ fn write_detail(
     result: &ContextResult,
     options: OutputOptions,
     theme: StatusTheme,
+    heading_theme: Option<StatusTheme>,
 ) -> io::Result<()> {
     let grouped = !result.group_results.is_empty();
     let items: Vec<_> = if grouped {
@@ -346,6 +369,7 @@ fn write_detail(
                 writer,
                 &group.items,
                 &group.result_groups,
+                heading_theme,
                 |writer, items| write_detail_items(writer, items, options, theme, &highlighter),
             )?;
         }
@@ -355,9 +379,13 @@ fn write_detail(
             .index
             .as_ref()
             .map_or(&[][..], |index| index.result_groups.as_slice());
-        write_rank_groups(writer, &result.items, groups, |writer, items| {
-            write_detail_items(writer, items, options, theme, &highlighter)
-        })?;
+        write_rank_groups(
+            writer,
+            &result.items,
+            groups,
+            heading_theme,
+            |writer, items| write_detail_items(writer, items, options, theme, &highlighter),
+        )?;
     }
     Ok(())
 }
